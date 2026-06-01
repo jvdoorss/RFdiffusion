@@ -1,4 +1,9 @@
-import torch.utils.checkpoint as checkpoint
+import torch
+from torch.utils import checkpoint
+from quatorch.quaternion import Quaternion, FUNCTIONS_RETURNING_QUATERNION
+# Add missing conversons to quatorch
+FUNCTIONS_RETURNING_QUATERNION |= {torch.stack,torch.Tensor.detach}
+
 from rfdiffusion.util_module import *
 from rfdiffusion.Attention_module import *
 from rfdiffusion.SE3_network import SE3TransformerWrapper
@@ -237,8 +242,8 @@ class Str2Str(nn.Module):
     def forward(self, 
                 msa: torch.Tensor, 
                 pair: torch.Tensor, 
-                R_in, 
-                T_in, 
+                Q_in: Quaternion, 
+                T_in: torch.Tensor, 
                 xyz: torch.Tensor, 
                 state, 
                 idx, 
@@ -293,27 +298,14 @@ class Str2Str(nn.Module):
         offset[:,motif_mask,...] = 0            # NOTE: motif mask is all zeros if not freeezing the motif 
 
         delTi = offset[:,:,0,:] / 10.0 # translation
-        R = offset[:,:,1,:] / 100.0 # rotation
-        
-        Qnorm = torch.sqrt( 1 + torch.sum(R*R, dim=-1) )
-        qA, qB, qC, qD = 1/Qnorm, R[:,:,0]/Qnorm, R[:,:,1]/Qnorm, R[:,:,2]/Qnorm
+        Q_imag = offset[:,:,1,:] / 100.0 # rotation
+        Q = Quaternion(Q_imag.new_ones(*Q_imag.shape[:2]),*Q_imag.unbind(-1)).normalize()
 
-        delRi = torch.zeros((B,L,3,3), device=xyz.device)
-        delRi[:,:,0,0] = qA*qA+qB*qB-qC*qC-qD*qD
-        delRi[:,:,0,1] = 2*qB*qC - 2*qA*qD
-        delRi[:,:,0,2] = 2*qB*qD + 2*qA*qC
-        delRi[:,:,1,0] = 2*qB*qC + 2*qA*qD
-        delRi[:,:,1,1] = qA*qA-qB*qB+qC*qC-qD*qD
-        delRi[:,:,1,2] = 2*qC*qD - 2*qA*qB
-        delRi[:,:,2,0] = 2*qB*qD - 2*qA*qC
-        delRi[:,:,2,1] = 2*qC*qD + 2*qA*qB
-        delRi[:,:,2,2] = qA*qA-qB*qB-qC*qC+qD*qD
-
-        Ri = einsum('bnij,bnjk->bnik', delRi, R_in)
+        Qi = Q * Q_in
         Ti = delTi + T_in #einsum('bnij,bnj->bni', delRi, T_in) + delTi
             
         alpha = self.sc_predictor(msa[:,0], state)
-        return Ri, Ti, state, alpha
+        return Qi, Ti, state, alpha
 
 class IterBlock(nn.Module):
     def __init__(self, d_msa=256, d_pair=128,
@@ -340,20 +332,20 @@ class IterBlock(nn.Module):
                                SE3_param=SE3_param,
                                p_drop=p_drop)
 
-    def forward(self, msa, pair, R_in, T_in, xyz, state, idx, motif_mask, use_checkpoint=False, cyclic_reses=None):
+    def forward(self, msa, pair, Q_in, T_in, xyz, state, idx, motif_mask, use_checkpoint=False, cyclic_reses=None):
         rbf_feat = rbf(torch.cdist(xyz[:,:,1,:], xyz[:,:,1,:]))
         if use_checkpoint:
             msa = checkpoint.checkpoint(create_custom_forward(self.msa2msa), msa, pair, rbf_feat, state)
             pair = checkpoint.checkpoint(create_custom_forward(self.msa2pair), msa, pair)
             pair = checkpoint.checkpoint(create_custom_forward(self.pair2pair), pair, rbf_feat)
-            R, T, state, alpha = checkpoint.checkpoint(create_custom_forward(self.str2str, top_k=0), msa, pair, R_in, T_in, xyz, state, idx, motif_mask, cyclic_reses)
+            Q, T, state, alpha = checkpoint.checkpoint(create_custom_forward(self.str2str, top_k=0), msa, pair, Q_in, T_in, xyz, state, idx, motif_mask, cyclic_reses)
         else:
             msa = self.msa2msa(msa, pair, rbf_feat, state)
             pair = self.msa2pair(msa, pair)
             pair = self.pair2pair(pair, rbf_feat)
-            R, T, state, alpha = self.str2str(msa, pair, R_in, T_in, xyz, state, idx, motif_mask=motif_mask, cyclic_reses=cyclic_reses, top_k=0) 
+            Q, T, state, alpha = self.str2str(msa, pair, Q_in, T_in, xyz, state, idx, motif_mask=motif_mask, cyclic_reses=cyclic_reses, top_k=0) 
         
-        return msa, pair, R, T, state, alpha
+        return msa, pair, Q, T, state, alpha
 
 class IterativeSimulator(nn.Module):
     def __init__(self, n_extra_block=4, n_main_block=12, n_ref_block=4,
@@ -424,24 +416,24 @@ class IterativeSimulator(nn.Module):
         if motif_mask is None:
             motif_mask = torch.zeros(L).bool()
 
-        R_in = torch.eye(3, device=xyz_in.device).reshape(1,1,3,3).expand(B, L, -1, -1)
+        Q_in = Quaternion(xyz_in.new_ones(B,L),*xyz_in.new_zeros(B,L,3).unbind(-1))
         T_in = xyz_in[:,:,1].clone()
         xyz_in = xyz_in - T_in.unsqueeze(-2)
         
         state = self.proj_state(state)
 
-        R_s = list()
+        Q_s = list()
         T_s = list()
         alpha_s = list()
         for i_m in range(self.n_extra_block):
-            R_in = R_in.detach() # detach rotation (for stability)
+            Q_in = Q_in.detach() # detach rotation (for stability)
             T_in = T_in.detach()
             # Get current BB structure
-            xyz = einsum('bnij,bnaj->bnai', R_in, xyz_in) + T_in.unsqueeze(-2)
+            xyz = Q_in.unsqueeze(-2).rotate_vector(xyz_in) + T_in.unsqueeze(-2)
 
-            msa_full, pair, R_in, T_in, state, alpha = self.extra_block[i_m](msa_full, 
+            msa_full, pair, Q_in, T_in, state, alpha = self.extra_block[i_m](msa_full, 
                                                                              pair,
-                                                                             R_in, 
+                                                                             Q_in, 
                                                                              T_in, 
                                                                              xyz, 
                                                                              state, 
@@ -449,19 +441,19 @@ class IterativeSimulator(nn.Module):
                                                                              motif_mask=motif_mask,
                                                                              use_checkpoint=use_checkpoint,
                                                                              cyclic_reses=cyclic_reses)
-            R_s.append(R_in)
+            Q_s.append(Q_in)
             T_s.append(T_in)
             alpha_s.append(alpha)
 
         for i_m in range(self.n_main_block):
-            R_in = R_in.detach()
+            Q_in = Q_in.detach()
             T_in = T_in.detach()
             # Get current BB structure
-            xyz = einsum('bnij,bnaj->bnai', R_in, xyz_in) + T_in.unsqueeze(-2)
+            xyz = Q_in.unsqueeze(-2).rotate_vector(xyz_in) + T_in.unsqueeze(-2)
             
-            msa, pair, R_in, T_in, state, alpha = self.main_block[i_m](msa, 
+            msa, pair, Q_in, T_in, state, alpha = self.main_block[i_m](msa, 
                                                                        pair,
-                                                                       R_in, 
+                                                                       Q_in, 
                                                                        T_in, 
                                                                        xyz, 
                                                                        state, 
@@ -469,18 +461,18 @@ class IterativeSimulator(nn.Module):
                                                                        motif_mask=motif_mask,
                                                                        use_checkpoint=use_checkpoint,
                                                                        cyclic_reses=cyclic_reses)
-            R_s.append(R_in)
+            Q_s.append(Q_in)
             T_s.append(T_in)
             alpha_s.append(alpha)
        
         state = self.proj_state2(state)
         for i_m in range(self.n_ref_block):
-            R_in = R_in.detach()
+            Q_in = Q_in.detach()
             T_in = T_in.detach()
-            xyz = einsum('bnij,bnaj->bnai', R_in, xyz_in) + T_in.unsqueeze(-2)
-            R_in, T_in, state, alpha = self.str_refiner(msa, 
+            xyz =  Q_in.unsqueeze(-2).rotate_vector(xyz_in) + T_in.unsqueeze(-2)
+            Q_in, T_in, state, alpha = self.str_refiner(msa, 
                                                         pair, 
-                                                        R_in, 
+                                                        Q_in, 
                                                         T_in, 
                                                         xyz, 
                                                         state, 
@@ -488,12 +480,12 @@ class IterativeSimulator(nn.Module):
                                                         top_k=64, 
                                                         motif_mask=motif_mask,
                                                         cyclic_reses=cyclic_reses)
-            R_s.append(R_in)
+            Q_s.append(Q_in)
             T_s.append(T_in)
             alpha_s.append(alpha)
 
-        R_s = torch.stack(R_s, dim=0)
+        Q_s = torch.stack(Q_s, dim=0)
         T_s = torch.stack(T_s, dim=0)
         alpha_s = torch.stack(alpha_s, dim=0)
 
-        return msa, pair, R_s, T_s, alpha_s, state
+        return msa, pair, Q_s, T_s, alpha_s, state

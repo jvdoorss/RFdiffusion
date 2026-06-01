@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
+
 from rfdiffusion.Embeddings import MSA_emb, Extra_emb, Templ_emb, Recycling
 from rfdiffusion.Track_module import IterativeSimulator
 from rfdiffusion.AuxiliaryPredictor import DistanceNetwork, MaskedTokenNetwork, ExpResolvedNetwork, LDDTNetwork
-from opt_einsum import contract as einsum
 
 class RoseTTAFoldModule(nn.Module):
     def __init__(self, 
@@ -100,13 +100,13 @@ class RoseTTAFoldModule(nn.Module):
         
         # Predict coordinates from given inputs
         is_frozen_residue = motif_mask if self.freeze_track_motif else torch.zeros_like(motif_mask).bool()
-        msa, pair, R, T, alpha_s, state = self.simulator(seq, msa_latent, msa_full, pair, xyz[:,:,:3],
+        msa, pair, Q, T, alpha_s, state = self.simulator(seq, msa_latent, msa_full, pair, xyz[:,:,:3],
                                                          state, idx, use_checkpoint=use_checkpoint,
                                                          motif_mask=is_frozen_residue, cyclic_reses=cyclic_reses)
         
         if return_raw:
             # get last structure
-            xyz = einsum('bnij,bnaj->bnai', R[-1], xyz[:,:,:3]-xyz[:,:,1].unsqueeze(-2)) + T[-1].unsqueeze(-2)
+            xyz = Q.unbind()[-1].unsqueeze(-2).rotate_vector(xyz[:,:,:3]-xyz[:,:,1].unsqueeze(-2)) + T[-1].unsqueeze(-2)
             return msa[:,0], pair, xyz, state, alpha_s[-1]
 
         # predict masked amino acids
@@ -117,7 +117,7 @@ class RoseTTAFoldModule(nn.Module):
 
         if return_infer:
             # get last structure
-            xyz = einsum('bnij,bnaj->bnai', R[-1], xyz[:,:,:3]-xyz[:,:,1].unsqueeze(-2)) + T[-1].unsqueeze(-2)
+            xyz = Q.unbind()[-1].unsqueeze(-2).rotate_vector(xyz[:,:,:3]-xyz[:,:,1].unsqueeze(-2)) + T[-1].unsqueeze(-2)
             
             # get scalar plddt
             nbin = lddt.shape[1]
@@ -136,6 +136,6 @@ class RoseTTAFoldModule(nn.Module):
         logits_exp = self.exp_pred(msa[:,0], state)
         
         # get all intermediate bb structures
-        xyz = einsum('rbnij,bnaj->rbnai', R, xyz[:,:,:3]-xyz[:,:,1].unsqueeze(-2)) + T.unsqueeze(-2)
+        xyz = Q.unsqueeze(-2).rotate_vector(xyz[:,:,:3]-xyz[:,:,1].unsqueeze(-2)) + T.unsqueeze(-2)
 
         return logits, logits_aa, logits_exp, xyz, alpha_s, lddt

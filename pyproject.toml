@@ -16,7 +16,8 @@ dependencies = [
     "omegaconf",
     "hydra-core",
     "opt_einsum",
-    "pyrsistent"
+    "pyrsistent",
+    "quatorch"
 ]
 
 [project.scripts]
