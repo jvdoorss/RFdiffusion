@@ -1,11 +1,27 @@
 import torch
 import numpy as np 
+
 from rfdiffusion.util import generate_Cbeta
+
+# global registers TODO should these be class variables to Potential?
+implemented_potentials = dict()
+'''
+Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
+If you implement a new potential it will be added to this dictionary for it to be used by
+the PotentialManager
+'''
+require_binderlen = set()
 
 class Potential:
     '''
         Interface class that defines the functions a potential must implement
     '''
+
+    def __init_subclass__(cls, requires_binderlen: bool = False, name: str | None = None) -> None:
+        key = name or cls.__name__
+        implemented_potentials[key] = cls
+        if requires_binderlen:
+            require_binderlen.add(key)
 
     def compute(self, xyz):
         '''
@@ -46,7 +62,7 @@ class monomer_ROG(Potential):
 
         return -1 * self.weight * rad_of_gyration
 
-class binder_ROG(Potential):
+class binder_ROG(Potential, requires_binderlen = True):
     '''
         Radius of Gyration potential for encouraging binder compactness
 
@@ -76,7 +92,7 @@ class binder_ROG(Potential):
         return -1 * self.weight * rad_of_gyration
 
 
-class dimer_ROG(Potential):
+class dimer_ROG(Potential, requires_binderlen = True):
     '''
         Radius of Gyration potential for encouraging compactness of both monomers when designing dimers
 
@@ -115,7 +131,7 @@ class dimer_ROG(Potential):
         #Potential value is the average of both radii of gyration (is avg. the best way to do this?)
         return -1 * self.weight * (rad_of_gyration_m1 + rad_of_gyration_m2)/2
 
-class binder_ncontacts(Potential):
+class binder_ncontacts(Potential, requires_binderlen = True):
     '''
         Differentiable way to maximise number of contacts within a protein
         
@@ -146,7 +162,7 @@ class binder_ncontacts(Potential):
         #Potential value is the average of both radii of gyration (is avg. the best way to do this?)
         return self.weight * binder_ncontacts.sum()
 
-class interface_ncontacts(Potential):
+class interface_ncontacts(Potential, requires_binderlen = True):
 
     '''
         Differentiable way to maximise number of contacts between binder and target
@@ -453,23 +469,3 @@ class substrate_contacts(Potential):
             rand_idx = torch.multinomial(idx, 1).long()
             self.motif_frame = xyz[rand_idx[0],:4]
             self.motif_mapping = [(rand_idx, i) for i in range(4)]
-
-# Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
-# If you implement a new potential you must add it to this dictionary for it to be used by
-# the PotentialManager
-implemented_potentials = { 'monomer_ROG':          monomer_ROG,
-                           'binder_ROG':           binder_ROG,
-                           'dimer_ROG':            dimer_ROG,
-                           'binder_ncontacts':     binder_ncontacts,
-                           'interface_ncontacts':  interface_ncontacts,
-                           'monomer_contacts':     monomer_contacts,
-                           'olig_contacts':        olig_contacts,
-                           'substrate_contacts':    substrate_contacts}
-
-require_binderlen      = { 'binder_ROG',
-                           'binder_distance_ReLU',
-                           'binder_any_ReLU',
-                           'dimer_ROG',
-                           'binder_ncontacts',
-                           'interface_ncontacts'}
-

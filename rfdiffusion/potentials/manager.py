@@ -133,10 +133,11 @@ class PotentialManager:
 
         setting_dict = {entry.split(':')[0]:entry.split(':')[1] for entry in potstr.split(',')}
 
-        for key in setting_dict:
-            if not key == 'type': setting_dict[key] = float(setting_dict[key])
+        def try_float(s: str) -> float | str:
+            try: return float(s)
+            except: return s                
 
-        return setting_dict
+        return {key: try_float(val) if not key == 'type' else val for key,val in setting_dict.items()}
 
     def initialize_all_potentials(self, setting_list):
         '''
