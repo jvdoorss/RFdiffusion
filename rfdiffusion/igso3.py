@@ -1,35 +1,23 @@
-"""SO(3) diffusion methods."""
-import numpy as np
-import os
-from functools import cached_property
+"""
+SO(3) diffusion methods.
+
+Tools to compute an Isotropic Gaussian distribution on SO(3).
+"""
+from math import log10
+
 import torch
-from scipy.spatial.transform import Rotation
-import scipy.linalg
+from torch import Tensor
+from quatorch import Quaternion
 
 
-### First define geometric operations on the SO3 manifold
-
-# hat map from vector space R^3 to Lie algebra so(3)
-def hat(v):
-    hat_v = torch.zeros([v.shape[0], 3, 3])
-    hat_v[:, 0, 1], hat_v[:, 0, 2], hat_v[:, 1, 2] = -v[:, 2], v[:, 1], -v[:, 0]
-    return hat_v + -hat_v.transpose(2, 1)
-
-# Logarithmic map from SO(3) to R^3 (i.e. rotation vector)
-def Log(R): return torch.tensor(Rotation.from_matrix(R.numpy()).as_rotvec())
-    
-# logarithmic map from SO(3) to so(3), this is the matrix logarithm
-def log(R): return hat(Log(R))
-
-# Exponential map from vector space of so(3) to SO(3), this is the matrix
-# exponential combined with the "hat" map
-def Exp(A): return torch.tensor(Rotation.from_rotvec(A.numpy()).as_matrix())
-
-# Angle of rotation SO(3) to R^+
-def Omega(R): return np.linalg.norm(log(R), axis=[-2, -1])/np.sqrt(2.)
+def quaternion_from_rot_vector(axis_angle: Tensor) -> Quaternion:
+    angle = axis_angle.norm()
+    axis = axis_angle / angle.unsqueeze(-1)
+    return Quaternion.from_axis_angle(axis,angle)
 
 L_default = 2000
-def f_igso3(omega, t, L=L_default):
+
+def f_igso3(omega: Tensor, t: Tensor | float, L : int = L_default) -> Tensor:
     """Truncated sum of IGSO(3) distribution.
 
     This function approximates the power series in equation 5 of
@@ -48,30 +36,45 @@ def f_igso3(omega, t, L=L_default):
         omega: i.e. the angle of rotation associated with rotation matrix
         t: variance parameter of IGSO(3), maps onto time in Brownian motion
         L: Truncation level
+
+    Returns:
+        2D tensor of shape (len(t), len(omega))  ((1, len(omega)) if t is float)
     """
-    ls = torch.arange(L)[None]  # of shape [1, L]
+
+    ls = torch.arange(L).reshape(1,1,-1)  # of shape [1, 1, L]
+    omega = omega.reshape(1,-1,1) # shape [1,*,1]
+    t = t.reshape(-1,1,1) if isinstance(t, Tensor) else omega.new_full((1,1,1),t) # shape [*,1,1]
     return ((2*ls + 1) * torch.exp(-ls*(ls+1)*t/2) *
-             torch.sin(omega[:, None]*(ls+1/2)) / torch.sin(omega[:, None]/2)).sum(dim=-1)
+             torch.sin(omega*(ls+1/2)) / torch.sin(omega/2)).sum(dim=-1)
 
-def d_logf_d_omega(omega, t, L=L_default):
-    omega = torch.tensor(omega, requires_grad=True)
-    log_f = torch.log(f_igso3(omega, t, L))
-    return torch.autograd.grad(log_f.sum(), omega)[0].numpy()
+def d_f_d_omega(omega: Tensor, t: Tensor | float, L: int = 2000) -> Tensor:
+    '''Explicit derivative of f_igso3 above'''
+    ls = torch.arange(L).reshape(1,1,-1)  # of shape [1, 1, L]
+    omega = omega.reshape(1,-1,1) # shape [1,*,1]
+    t = t.reshape(-1,1,1) if isinstance(t, Tensor) else omega.new_full((1,1,1),t) # shape [*,1,1]
+    coeff = (2*ls + 1) * torch.exp(-ls*(ls+1)*t/2)
+    arg1 = omega*(ls+1/2)
+    arg2 = omega/2
+    return 0.5 * (coeff * ((2*ls + 1) * torch.cos(arg1)/torch.sin(arg2) - torch.sin(arg1) * torch.cos(arg2)/ torch.sin(arg2)**2)).sum(-1)
 
-# IGSO3 density with respect to the volume form on SO(3)
-def igso3_density(Rt, t, L=L_default):
-    return f_igso3(torch.tensor(Omega(Rt)), t, L).numpy()
+def d_logf_d_omega(omega: Tensor, t: Tensor | float, L: int = 2000) -> Tensor:
+    '''Explicit derivative of f_igso3 above'''
+    return d_f_d_omega(omega,t,L) / f_igso3(omega,t,L)
 
-def igso3_density_angle(omega, t, L=L_default): 
-    return f_igso3(torch.tensor(omega), t, L).numpy()*(1-np.cos(omega))/np.pi
+def d_logf_d_omega_old(omega: Tensor, t: Tensor | float, L: int = L_default) -> Tensor:
+    omega_diff = torch.tensor(omega, requires_grad=True)
+    log_f = torch.log(f_igso3(omega_diff, t, L))
+    return torch.autograd.grad(log_f, omega_diff)[0]
 
-# grad_R log IGSO3(R; I_3, t)
-def igso3_score(R, t, L=L_default):
-    omega = Omega(R)
-    unit_vector = np.einsum('Nij,Njk->Nik', R, log(R))/omega[:, None, None]
-    return unit_vector * d_logf_d_omega(omega, t, L)[:, None, None]
+def igso3_density(Qt: Quaternion, t: Tensor | float, L: int = L_default):
+    '''IGSO3 density with respect to the volume form on SO(3)'''
+    _, omega = Qt.to_axis_angle()
+    return f_igso3(omega, t, L).numpy()
 
-def calculate_igso3(*, num_sigma, num_omega, min_sigma, max_sigma):
+def igso3_density_angle(omega: Tensor, t: float | Tensor, L: int = L_default) -> Tensor: 
+    return f_igso3(omega, t, L) * (1-torch.cos(omega)) / torch.pi
+
+def calculate_igso3(*, num_sigma: int, num_omega: int, min_sigma: float, max_sigma: float) -> dict[str,Tensor]:
     """calculate_igso3 pre-computes numerical approximations to the IGSO3 cdfs
     and score norms and expected squared score norms.
 
@@ -85,30 +88,24 @@ def calculate_igso3(*, num_sigma, num_omega, min_sigma, max_sigma):
             be too low or it will create numerical instability.
     """
     # Discretize omegas for calculating CDFs. Skip omega=0.
-    discrete_omega = np.linspace(0, np.pi, num_omega+1)[1:]
+    discrete_omega = torch.linspace(0, torch.pi, num_omega+1)[1:]
 
     # Exponential noise schedule.  This choice is closely tied to the
     # scalings used when simulating the reverse time SDE. For each step n,
     # discrete_sigma[n] = min_eps^(1-n/num_eps) * max_eps^(n/num_eps)
-    discrete_sigma = 10 ** np.linspace(np.log10(min_sigma), np.log10(max_sigma), num_sigma + 1)[1:]
+    discrete_sigma = 10 ** torch.linspace(log10(min_sigma), log10(max_sigma), num_sigma + 1)[1:]
 
     # Compute the pdf and cdf values for the marginal distribution of the angle
     # of rotation (which is needed for sampling)
-    pdf_vals = np.asarray(
-        [igso3_density_angle(discrete_omega, sigma**2) for sigma in discrete_sigma])
-    cdf_vals = np.asarray(
-        [pdf.cumsum() / num_omega * np.pi for pdf in pdf_vals])
+    pdf_vals = igso3_density_angle(discrete_omega, discrete_sigma**2)
+    cdf_vals = pdf_vals.cumsum(dim=-1) / num_omega * torch.pi
 
     # Compute the norms of the scores.  This are used to scale the rotation axis when
     # computing the score as a vector.
-    score_norm = np.asarray(
-        [d_logf_d_omega(discrete_omega, sigma**2) for sigma in discrete_sigma])
+    score_norm = d_logf_d_omega(discrete_omega, discrete_sigma**2)
 
     # Compute the standard deviation of the score norm for each sigma
-    exp_score_norms = np.sqrt(
-        np.sum(
-            score_norm**2 * pdf_vals, axis=1) / np.sum(
-                pdf_vals, axis=1))
+    exp_score_norms = torch.sqrt(torch.sum(score_norm**2 * pdf_vals, dim=1) / torch.sum(pdf_vals, dim=1))
     return {
         'cdf': cdf_vals,
         'score_norm': score_norm,

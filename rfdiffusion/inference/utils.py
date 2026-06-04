@@ -1,24 +1,26 @@
-import numpy as np
+import random
+import logging
+import glob
 import os
+
+import numpy as np
 from omegaconf import DictConfig
 import torch
-import torch.nn.functional as nn
-from rfdiffusion.diffusion import get_beta_schedule
-from scipy.spatial.transform import Rotation as scipy_R
+from quatorch import Quaternion
+
+from rfdiffusion.diffusion import get_beta_schedule, Diffuser
 from rfdiffusion.util import rigid_from_3_points
 from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion import util
-import random
-import logging
+
 from rfdiffusion.inference import model_runners
-import glob
 
 ###########################################################
 #### Functions which can be called outside of Denoiser ####
 ###########################################################
 
 
-def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=1.0):
+def get_next_frames(xt, px0, t, diffuser: Diffuser, so3_type, diffusion_mask, noise_scale=1.0) -> torch.Tensor:
     """
     get_next_frames gets updated frames using IGSO(3) + score_based reverse diffusion.
 
@@ -54,19 +56,17 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
     R_t, Ca_t = rigid_from_3_points(N_t, Ca_t, C_t)
 
     # this must be to normalize them or something
-    R_0 = scipy_R.from_matrix(R_0.squeeze().numpy()).as_matrix()
-    R_t = scipy_R.from_matrix(R_t.squeeze().numpy()).as_matrix()
+    R_0 = Quaternion.from_rotation_matrix(R_0.squeeze())
+    R_t = Quaternion.from_rotation_matrix(R_t.squeeze())
 
     L = R_t.shape[0]
-    all_rot_transitions = np.broadcast_to(np.identity(3), (L, 3, 3)).copy()
+    all_rot_transitions = Quaternion(R_t.new_ones(R_t.shape[:-1]), *R_t.new_zeros((3,)+R_t.shape[:-1]))
     # Sample next frame for each residue
     if so3_type == "igso3":
         # don't do calculations on masked positions since they end up as identity matrix
-        all_rot_transitions[
-            ~diffusion_mask
-        ] = diffuser.so3_diffuser.reverse_sample_vectorized(
-            R_t[~diffusion_mask],
-            R_0[~diffusion_mask],
+        all_rot_transitions[~diffusion_mask] = diffuser.so3_diffuser.reverse_sample_vectorized(
+            R_t[~diffusion_mask].as_subclass(Quaternion),
+            R_0[~diffusion_mask].as_subclass(Quaternion),
             t,
             noise_level=noise_scale,
             mask=None,
@@ -75,20 +75,13 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
     else:
         assert False, "so3 diffusion type %s not implemented" % so3_type
 
-    all_rot_transitions = all_rot_transitions[:, None, :, :]
-
     # Apply the interpolated rotation matrices to the coordinates
-    next_crds = (
-        np.einsum(
-            "lrij,laj->lrai",
-            all_rot_transitions,
-            xt[:, :3, :] - Ca_t.squeeze()[:, None, ...].numpy(),
-        )
-        + Ca_t.squeeze()[:, None, None, ...].numpy()
-    )
+    next_crds = all_rot_transitions.unsqueeze(1).rotate_vector(
+            (xt[:, :3, :] - Ca_t.squeeze()[:, None])
+        ) + Ca_t.squeeze()[:, None]
 
     # (L,3,3) set of backbone coordinates with slight rotation
-    return next_crds.squeeze(1)
+    return next_crds
 
 
 def get_mu_xt_x0(xt, px0, t, beta_schedule, alphabar_schedule, eps=1e-6):
@@ -488,7 +481,7 @@ class Denoise:
         ca_deltas += self.potential_manager.get_guide_scale(t) * grad_ca
 
         # add the delta to the new frames
-        frames_next = torch.from_numpy(frames_next) + ca_deltas[:, None, :]  # translate
+        frames_next = frames_next + ca_deltas[:, None, :]  # translate
 
         fullatom_next = torch.full_like(xt, float("nan")).unsqueeze(0)
         fullatom_next[:, :, :3] = frames_next[None]
