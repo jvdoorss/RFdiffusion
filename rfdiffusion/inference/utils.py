@@ -1,3 +1,5 @@
+
+from typing import Literal, Callable, Any
 import random
 import logging
 import glob
@@ -6,11 +8,12 @@ import os
 import numpy as np
 from omegaconf import DictConfig
 import torch
+from torch import Tensor, BoolTensor, LongTensor
 from quatorch import Quaternion
 
+from rfdiffusion.potentials.manager import PotentialManager
 from rfdiffusion.diffusion import get_beta_schedule, Diffuser
 from rfdiffusion.util import rigid_from_3_points
-from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion import util
 
 from rfdiffusion.inference import model_runners
@@ -20,7 +23,15 @@ from rfdiffusion.inference import model_runners
 ###########################################################
 
 
-def get_next_frames(xt, px0, t, diffuser: Diffuser, so3_type, diffusion_mask, noise_scale=1.0) -> torch.Tensor:
+def get_next_frames(
+    xt: Tensor, 
+    px0: Tensor, 
+    t: Tensor, 
+    diffuser: Diffuser, 
+    so3_type: Literal['igso3'], 
+    diffusion_mask: BoolTensor, 
+    noise_scale: float = 1.0
+    ) -> Tensor:
     """
     get_next_frames gets updated frames using IGSO(3) + score_based reverse diffusion.
 
@@ -59,7 +70,6 @@ def get_next_frames(xt, px0, t, diffuser: Diffuser, so3_type, diffusion_mask, no
     R_0 = Quaternion.from_rotation_matrix(R_0.squeeze())
     R_t = Quaternion.from_rotation_matrix(R_t.squeeze())
 
-    L = R_t.shape[0]
     all_rot_transitions = Quaternion(R_t.new_ones(R_t.shape[:-1]), *R_t.new_zeros((3,)+R_t.shape[:-1]))
     # Sample next frame for each residue
     if so3_type == "igso3":
@@ -73,7 +83,7 @@ def get_next_frames(xt, px0, t, diffuser: Diffuser, so3_type, diffusion_mask, no
             return_perturb=True,
         )
     else:
-        assert False, "so3 diffusion type %s not implemented" % so3_type
+        raise ValueError(f"so3 diffusion type {so3_type} not implemented")
 
     # Apply the interpolated rotation matrices to the coordinates
     next_crds = all_rot_transitions.unsqueeze(1).rotate_vector(
@@ -84,7 +94,14 @@ def get_next_frames(xt, px0, t, diffuser: Diffuser, so3_type, diffusion_mask, no
     return next_crds
 
 
-def get_mu_xt_x0(xt, px0, t, beta_schedule, alphabar_schedule, eps=1e-6):
+def get_mu_xt_x0(
+    xt: Tensor, 
+    px0: Tensor, 
+    t: LongTensor, 
+    beta_schedule: Tensor, 
+    alphabar_schedule: Tensor, 
+    eps: float = 1e-6
+    ) -> tuple[Tensor,Tensor]:
     """
     Given xt, predicted x0 and the timestep t, give mu of x(t-1)
     Assumes t is 0 indexed
@@ -116,15 +133,15 @@ def get_mu_xt_x0(xt, px0, t, beta_schedule, alphabar_schedule, eps=1e-6):
 
 
 def get_next_ca(
-    xt,
-    px0,
-    t,
-    diffusion_mask,
-    crd_scale,
+    xt: Tensor,
+    px0: Tensor,
+    t: LongTensor,
+    diffusion_mask: BoolTensor | None,
+    crd_scale : float,
     beta_schedule,
     alphabar_schedule,
-    noise_scale=1.0,
-):
+    noise_scale: float = 1.0,
+    ) -> tuple[Tensor, Tensor]:
     """
     Given full atom x0 prediction (xyz coordinates), diffuse to x(t-1)
 
@@ -145,9 +162,6 @@ def get_next_ca(
         noise_scale: scale factor for the noise being added
 
     """
-    get_allatom = ComputeAllAtomCoords().to(device=xt.device)
-    L = len(xt)
-
     # bring to origin after global alignment (when don't have a motif) or replace input motif and bring to origin, and then scale
     px0 = px0 * crd_scale
     xt = xt * crd_scale
@@ -169,7 +183,7 @@ def get_next_ca(
     return out_crds / crd_scale, delta / crd_scale
 
 
-def get_noise_schedule(T, noiseT, noise1, schedule_type):
+def get_noise_schedule(T: int, noiseT: float, noise1: float, schedule_type: Literal['constant','linear']) -> Callable[[int | LongTensor],float | Tensor]:
     """
     Function to create a schedule that varies the scale of noise given to the model over time
 
@@ -189,16 +203,13 @@ def get_noise_schedule(T, noiseT, noise1, schedule_type):
 
     """
 
-    noise_schedules = {
-        "constant": lambda t: noiseT,
-        "linear": lambda t: ((t - 1) / (T - 1)) * (noiseT - noise1) + noise1,
-    }
-
-    assert (
-        schedule_type in noise_schedules
-    ), f"noise_schedule must be one of {noise_schedules.keys()}. Received noise_schedule={schedule_type}. Exiting."
-
-    return noise_schedules[schedule_type]
+    match schedule_type:
+        case 'constant':
+            return lambda t: noiseT
+        case "linear": 
+            return lambda t: ((t - 1) / (T - 1)) * (noiseT - noise1) + noise1
+        case _:
+            raise ValueError(f"noise_schedule must be one of ['constant','linear']. Received noise_schedule={schedule_type}. Exiting.")
 
 
 class Denoise:
@@ -213,28 +224,28 @@ class Denoise:
 
     def __init__(
         self,
-        T,
-        L,
-        diffuser,
-        b_0=0.001,
-        b_T=0.1,
-        min_b=1.0,
-        max_b=12.5,
-        min_sigma=0.05,
-        max_sigma=1.5,
-        noise_level=0.5,
-        schedule_type="linear",
-        so3_schedule_type="linear",
-        schedule_kwargs={},
-        so3_type="igso3",
-        noise_scale_ca=1.0,
-        final_noise_scale_ca=1,
-        ca_noise_schedule_type="constant",
-        noise_scale_frame=0.5,
-        final_noise_scale_frame=0.5,
-        frame_noise_schedule_type="constant",
-        crd_scale=1 / 15,
-        potential_manager=None,
+        T: int,
+        L: int,
+        diffuser: Diffuser,
+        b_0: float = 0.001,
+        b_T: float = 0.1,
+        min_b: float = 1.0,
+        max_b: float = 12.5,
+        min_sigma: float = 0.05,
+        max_sigma: float = 1.5,
+        noise_level: float = 0.5,
+        schedule_type: Literal['constant','linear'] = "linear",
+        so3_schedule_type: Literal['constant','linear'] = "linear",
+        schedule_kwargs: dict = {},
+        so3_type: Literal ['igso3'] = "igso3",
+        noise_scale_ca: float = 1.0,
+        final_noise_scale_ca: float = 1.0,
+        ca_noise_schedule_type: Literal['constant','linear'] = "constant",
+        noise_scale_frame: float = 0.5,
+        final_noise_scale_frame: float = 0.5,
+        frame_noise_schedule_type: Literal['constant','linear'] = "constant",
+        crd_scale: float = 1 / 15,
+        potential_manager: PotentialManager | None =None,
         partial_T=None,
     ):
         """
@@ -279,11 +290,7 @@ class Denoise:
             self.frame_noise_schedule_type,
         )
 
-    @property
-    def idx2steps(self):
-        return self.decode_scheduler.idx2steps.numpy()
-
-    def align_to_xt_motif(self, px0, xT, diffusion_mask, eps=1e-6):
+    def align_to_xt_motif(self, px0: Tensor, xT: Tensor, diffusion_mask: BoolTensor, eps: float = 1e-6) -> Tensor:
         """
         Need to align px0 to motif in xT. This is to permit the swapping of residue positions in the px0 motif for the true coordinates.
         First, get rotation matrix from px0 to xT for the motif residues.
@@ -291,10 +298,10 @@ class Denoise:
         Third, centre at origin
         """
 
-        def rmsd(V, W, eps=0):
+        def rmsd(V: Tensor, W: Tensor, eps: float = 0.0) -> Tensor:
             # First sum down atoms, then sum down xyz
             N = V.shape[-2]
-            return np.sqrt(np.sum((V - W) * (V - W), axis=(-2, -1)) / N + eps)
+            return torch.sqrt((V - W).square().sum(dim=(-2,-1)) / N + eps)
 
         assert (
             xT.shape[1] == px0.shape[1]
@@ -302,58 +309,42 @@ class Denoise:
 
         L, n_atom, _ = xT.shape  # A is number of atoms
         atom_mask = ~torch.isnan(px0)
-        # convert to numpy arrays
-        px0 = px0.cpu().detach().numpy()
-        xT = xT.cpu().detach().numpy()
-        diffusion_mask = diffusion_mask.cpu().detach().numpy()
 
         # 1 centre motifs at origin and get rotation matrix
         px0_motif = px0[diffusion_mask, :3].reshape(-1, 3)
         xT_motif = xT[diffusion_mask, :3].reshape(-1, 3)
-        px0_motif_mean = np.copy(px0_motif.mean(0))  # need later
-        xT_motif_mean = np.copy(xT_motif.mean(0))
+        px0_motif_mean = px0_motif.mean(0)  # need later
+        xT_motif_mean = xT_motif.mean(0)
 
         # center at origin
         px0_motif = px0_motif - px0_motif_mean
         xT_motif = xT_motif - xT_motif_mean
 
-        # A = px0_motif
-        # B = xT_motif
-        A = xT_motif
-        B = px0_motif
-
-        C = np.matmul(A.T, B)
-
         # compute optimal rotation matrix using SVD
-        U, S, Vt = np.linalg.svd(C)
-
-        # ensure right handed coordinate system
-        d = np.eye(3)
-        d[-1, -1] = np.sign(np.linalg.det(Vt.T @ U.T))
+        U, S, Vt = torch.svd(xT_motif.T @ px0_motif)
 
         # construct rotation matrix
-        R = Vt.T @ d @ U.T
+        R = U @ Vt
 
         # get rotated coords
-        rB = B @ R
+        rB = px0_motif @ R.T
 
         # calculate rmsd
-        rms = rmsd(A, rB)
+        rms = rmsd(xT_motif, rB)
         self._log.info(f"Sampled motif RMSD: {rms:.2f}")
 
         # 2 rotate whole px0 by rotation matrix
-        atom_mask = atom_mask.cpu()
         px0[~atom_mask] = 0  # convert nans to 0
         px0 = px0.reshape(-1, 3) - px0_motif_mean
-        px0_ = px0 @ R
+        px0_ = px0 @ R.T
 
         # 3 put in same global position as xT
         px0_ = px0_ + xT_motif_mean
         px0_ = px0_.reshape([L, n_atom, 3])
         px0_[~atom_mask] = float("nan")
-        return torch.Tensor(px0_)
+        return px0_
 
-    def get_potential_gradients(self, xyz, diffusion_mask):
+    def get_potential_gradients(self, xyz: Tensor, diffusion_mask: BoolTensor) -> Tensor:
         """
         This could be moved into potential manager if desired - NRB
 
@@ -368,12 +359,9 @@ class Denoise:
             Ca_grads (torch.tensor): [L,3] The gradient at each Ca atom
         """
 
-        if self.potential_manager == None or self.potential_manager.is_empty():
-            return torch.zeros(xyz.shape[0], 3)
+        if self.potential_manager is None or self.potential_manager.is_empty():
+            return xyz.new_zeros(xyz.shape[0], 3)
 
-        use_Cb = False
-
-        # seq.requires_grad = True
         xyz.requires_grad = True
 
         if not xyz.grad is None:
@@ -386,26 +374,26 @@ class Denoise:
         # Need access to calculated Cb coordinates to be able to get Cb grads though
         Ca_grads = xyz.grad[:, 1, :]
 
-        if not diffusion_mask == None:
-            Ca_grads[diffusion_mask, :] = 0
+        if diffusion_mask is not None:
+            Ca_grads[diffusion_mask, :] = 0.0
 
         # check for NaN's
         if torch.isnan(Ca_grads).any():
             print("WARNING: NaN in potential gradients, replacing with zero grad.")
-            Ca_grads[:] = 0
+            Ca_grads[:] = 0.0
 
         return Ca_grads
 
     def get_next_pose(
         self,
-        xt,
-        px0,
-        t,
-        diffusion_mask,
-        fix_motif=True,
-        align_motif=True,
-        include_motif_sidechains=True,
-    ):
+        xt: Tensor,
+        px0: Tensor,
+        t: LongTensor,
+        diffusion_mask: BoolTensor,
+        fix_motif: bool = True,
+        align_motif: bool = True,
+        include_motif_sidechains: bool = True,
+    ) -> tuple[Tensor,Tensor]:
         """
         Wrapper function to take px0, xt and t, and to produce xt-1
         First, aligns px0 to xt
@@ -428,8 +416,6 @@ class Denoise:
             include_motif_sidechains (bool): Provide sidechains of the fixed motif to the model
         """
 
-        get_allatom = ComputeAllAtomCoords().to(device=xt.device)
-        L, n_atom = xt.shape[:2]
         assert (xt.shape[1] == 14) or (xt.shape[1] == 27)
         assert (px0.shape[1] == 14) or (px0.shape[1] == 27)
 
@@ -485,8 +471,6 @@ class Denoise:
 
         fullatom_next = torch.full_like(xt, float("nan")).unsqueeze(0)
         fullatom_next[:, :, :3] = frames_next[None]
-        # This is never used so just make it a fudged tensor - NRB
-        torsions_next = torch.zeros(1, 1)
 
         if include_motif_sidechains:
             fullatom_next[:, diffusion_mask, :14] = xt[None, diffusion_mask]
@@ -494,29 +478,28 @@ class Denoise:
         return fullatom_next.squeeze()[:, :14, :], px0
 
 
-def sampler_selector(conf: DictConfig):
+def sampler_selector(conf: DictConfig) -> model_runners.Sampler:
     if conf.scaffoldguided.scaffoldguided:
-        sampler = model_runners.ScaffoldedSampler(conf)
-    else:
-        if conf.inference.model_runner == "default":
-            sampler = model_runners.Sampler(conf)
-        elif conf.inference.model_runner == "SelfConditioning":
-            sampler = model_runners.SelfConditioning(conf)
-        elif conf.inference.model_runner == "ScaffoldedSampler":
-            sampler = model_runners.ScaffoldedSampler(conf)
-        else:
-            raise ValueError(f"Unrecognized sampler {conf.model_runner}")
-    return sampler
+        return model_runners.ScaffoldedSampler(conf)
+    match conf.inference.model_runner:
+        case "default":
+            return model_runners.Sampler(conf)
+        case "SelfConditioning":
+            return model_runners.SelfConditioning(conf)
+        case "ScaffoldedSampler":
+            return model_runners.ScaffoldedSampler(conf)
+        case _ as sampler:
+            raise ValueError(f"Unrecognized sampler {sampler}")
 
 
-def parse_pdb(filename, **kwargs):
+def parse_pdb(filename: str, **kwargs) -> dict[str, Any]:
     """extract xyz coords for all heavy atoms"""
     with open(filename,"r") as f:
         lines=f.readlines()
     return parse_pdb_lines(lines, **kwargs)
 
 
-def parse_pdb_lines(lines, parse_hetatom=False, ignore_het_h=True):
+def parse_pdb_lines(lines: list[str], parse_hetatom: bool = False, ignore_het_h: bool = True) -> dict[str, Any]:
     # indices of residues observed in the structure
     res, pdb_idx = [],[]
     for l in lines:
@@ -603,7 +586,7 @@ def parse_pdb_lines(lines, parse_hetatom=False, ignore_het_h=True):
     return out
 
 
-def process_target(pdb_path, parse_hetatom=False, center=True):
+def process_target(pdb_path: str, parse_hetatom: bool = False, center: bool = True) -> dict[str, Any]:
     # Read target pdb and extract features.
     target_struct = parse_pdb(pdb_path, parse_hetatom=parse_hetatom)
 
@@ -634,22 +617,24 @@ def process_target(pdb_path, parse_hetatom=False, center=True):
     return out
 
 
-def get_idx0_hotspots(mappings, ppi_conf, binderlen):
+def get_idx0_hotspots(mappings: dict, ppi_conf: DictConfig, binderlen: int) -> list[int]:
     """
     Take pdb-indexed hotspot resudes and the length of the binder, and makes the 0-indexed tensor of hotspots
     """
 
-    hotspot_idx = None
-    if binderlen > 0:
-        if ppi_conf.hotspot_res is not None:
-            assert all(
-                [i[0].isalpha() for i in ppi_conf.hotspot_res]
-            ), "Hotspot residues need to be provided in pdb-indexed form. E.g. A100,A103"
-            hotspots = [(i[0], int(i[1:])) for i in ppi_conf.hotspot_res]
-            hotspot_idx = []
-            for i, res in enumerate(mappings["receptor_con_ref_pdb_idx"]):
-                if res in hotspots:
-                    hotspot_idx.append(mappings["receptor_con_hal_idx0"][i])
+    if binderlen == 0 or ppi_conf.hotspot_res is None:
+        return None
+
+    assert all(
+        [i[0].isalpha() for i in ppi_conf.hotspot_res]
+    ), "Hotspot residues need to be provided in pdb-indexed form. E.g. A100,A103"
+
+    hotspots = [(i[0], int(i[1:])) for i in ppi_conf.hotspot_res]
+    hotspot_idx = []
+    for i, res in enumerate(mappings["receptor_con_ref_pdb_idx"]):
+        if res in hotspots:
+            hotspot_idx.append(mappings["receptor_con_hal_idx0"][i])
+    
     return hotspot_idx
 
 
@@ -674,7 +659,7 @@ class BlockAdjacency:
         - adj: block adjacency with equivalent masking as ss (L,L)
     """
 
-    def __init__(self, conf, num_designs):
+    def __init__(self, conf: DictConfig, num_designs: int):
         """
         Parameters:
           inputs:
@@ -684,24 +669,21 @@ class BlockAdjacency:
        
         self.conf=conf 
         # either list or path to .txt file with list of scaffolds
-        if self.conf.scaffoldguided.scaffold_list is not None:
-            if type(self.conf.scaffoldguided.scaffold_list) == list:
+        match self.conf.scaffoldguided.scaffold_list:
+            case list() as scaffold_list:
                 self.scaffold_list = scaffold_list
-            elif self.conf.scaffoldguided.scaffold_list[-4:] == ".txt":
+            case str() as scaffold_file if scaffold_file[-4:] == ".txt":
                 # txt file with list of ids
-                list_from_file = []
-                with open(self.conf.scaffoldguided.scaffold_list, "r") as f:
-                    for line in f:
-                        list_from_file.append(line.strip())
-                self.scaffold_list = list_from_file
-            else:
+                with open(scaffold_file, "r") as f:
+                    self.scaffold_list = [line.strip() for line in f.readlines()]
+            case None:
+                self.scaffold_list = [
+                    os.path.split(i)[1][:-6]
+                    for i in glob.glob(f"{self.conf.scaffoldguided.scaffold_dir}/*_ss.pt")
+                ]
+                self.scaffold_list.sort()
+            case _:
                 raise NotImplementedError
-        else:
-            self.scaffold_list = [
-                os.path.split(i)[1][:-6]
-                for i in glob.glob(f"{self.conf.scaffoldguided.scaffold_dir}/*_ss.pt")
-            ]
-            self.scaffold_list.sort()
 
         # path to directory with scaffolds, ss files and block_adjacency files
         self.scaffold_dir = self.conf.scaffoldguided.scaffold_dir
@@ -752,15 +734,13 @@ class BlockAdjacency:
             self.item_n = 0
 
         # whether to mask loops or not
-        if not self.conf.scaffoldguided.mask_loops:
+        self.mask_loops = self.conf.scaffoldguided.mask_loops
+        if not self.mask_loops:
             assert self.conf.scaffoldguided.sampled_N == 0, "can't add length if not masking loops"
             assert self.conf.scaffoldguided.sampled_C == 0, "can't add lemgth if not masking loops"
             assert self.conf.scaffoldguided.sampled_insertion == 0, "can't add length if not masking loops"
-            self.mask_loops = False
-        else:
-            self.mask_loops = True
 
-    def get_ss_adj(self, item):
+    def get_ss_adj(self, item: str) -> tuple[Tensor, Tensor]:
         """
         Given at item, get the ss tensor and block adjacency matrix for that item
         """
@@ -771,36 +751,17 @@ class BlockAdjacency:
 
         return ss, adj
 
-    def mask_to_segments(self, mask):
+    def mask_to_segments(self, mask: BoolTensor) -> list[tuple[Literal['ss','loop'],int]]:
         """
         Takes a mask of True (loop) and False (non-loop), and outputs list of tuples (loop or not, length of element)
         """
-        segments = []
-        begin = -1
-        end = -1
-        for i in range(mask.shape[0]):
-            # Starting edge case
-            if i == 0:
-                begin = 0
-                continue
+        jumps = mask.diff()
+        begin = torch.nonzero(jumps).squeeze(-1) # non-trivial segment starts
+        lengths = begin.diff(prepend = torch.tensor([-1]), append = torch.tensor([len(mask)-1]))
+        values = torch.concat([mask[:1],mask[begin]])
+        return [("loop" if val.item() else "ss", length.item()) for val, length in zip(values, lengths)]
 
-            if not mask[i] == mask[i - 1]:
-                end = i
-                if mask[i - 1].item() is True:
-                    segments.append(("loop", end - begin))
-                else:
-                    segments.append(("ss", end - begin))
-                begin = i
-
-        # Ending edge case: last segment is length one
-        if not end == mask.shape[0]:
-            if mask[i].item() is True:
-                segments.append(("loop", mask.shape[0] - begin))
-            else:
-                segments.append(("ss", mask.shape[0] - begin))
-        return segments
-
-    def expand_mask(self, mask, segments):
+    def expand_mask(self, mask: BoolTensor, segments: list[tuple[Literal['ss','loop'],int]]) -> Tensor:
         """
         Function to generate a new mask with dilated loops and N and C terminal additions
         """
@@ -821,7 +782,13 @@ class BlockAdjacency:
         assert torch.sum(torch.tensor(output)) == torch.sum(~mask)
         return torch.tensor(output)
 
-    def expand_ss(self, ss, adj, mask, expanded_mask):
+    def expand_ss(
+        self, 
+        ss: Tensor, 
+        adj: Tensor, 
+        mask: BoolTensor, 
+        expanded_mask: BoolTensor
+        ) -> tuple[Tensor, Tensor]:
         """
         Given an expanded mask, populate a new ss and adj based on this
         """
@@ -842,7 +809,7 @@ class BlockAdjacency:
 
         return ss_out, adj_out
 
-    def mask_ss_adj(self, ss, adj, expanded_mask):
+    def mask_ss_adj(self, ss: Tensor, adj: Tensor, expanded_mask: BoolTensor) -> tuple[Tensor, Tensor]:
         """
         Given an expanded ss and adj, mask some number of residues at either end of non-loop ss
         """
@@ -863,7 +830,7 @@ class BlockAdjacency:
 
         return ss, adj
 
-    def get_scaffold(self):
+    def get_scaffold(self) -> tuple[int, Tensor]:
         """
         Wrapper method for pulling an item from the list, and preparing ss and block adj features
         """
@@ -916,7 +883,7 @@ class Target:
         - Dictionary of xyz coordinates, indices, pdb_indices, pdb mask
     """
 
-    def __init__(self, conf: DictConfig, hotspots=None):
+    def __init__(self, conf: DictConfig, hotspots: list | None = None):
         self.pdb = parse_pdb(conf.target_path)
 
         if hotspots is not None:
@@ -933,7 +900,8 @@ class Target:
         if conf.contig_crop:
             self.contig_crop(conf.contig_crop)
 
-    def parse_contig(self, contig_crop):
+    @classmethod
+    def parse_contig(cls, contig_crop):
         """
         Takes contig input and parses
         """
@@ -992,10 +960,10 @@ class Target:
                 self.pdb[key] = [i for idx, i in enumerate(val) if mask[idx]]
         self.pdb["crop_mask"] = mask
 
-    def get_target(self):
+    def get_target(self) -> dict:
         return self.pdb
 
-def ss_from_contig(ss_masks: dict):
+def ss_from_contig(ss_masks: dict) -> LongTensor:
     """  
     Function for taking 1D masks for each of the ss types, and outputting a secondary structure input
     """

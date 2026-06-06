@@ -741,3 +741,13 @@ def calc_rmsd(xyz1, xyz2, eps=1e-6):
     rmsd = np.sqrt(np.sum((xyz2_-xyz1)*(xyz2_-xyz1), axis=(0,1)) / L + eps)
 
     return rmsd, U
+
+def get_torsions_initialized(   xyz_in: torch.Tensor, 
+                                seq: torch.Tensor, 
+                                torsion_indices: torch.Tensor = torsion_indices, 
+                                torsion_can_flip: torch.Tensor = torsion_can_flip, 
+                                reference_angles: torch.Tensor = reference_angles,
+                                mask_in: torch.BoolTensor | None = None) -> tuple[torch.Tensor,torch.Tensor, torch.Tensor, torch.Tensor]:
+    '''Get torsions with initialized residue properties'''
+    return get_torsions(xyz_in, seq, torsion_indices, torsion_can_flip, reference_angles, mask_in)
+

@@ -1,16 +1,17 @@
 # script for diffusion protocols
+
+from typing import Iterable
 import os
 import logging
 import time
 import pickle
 
 import torch
-from torch import Tensor
+from torch import Tensor, BoolTensor
 import numpy as np
 from numpy.typing import NDArray
 
 from rfdiffusion.util import rigid_from_3_points
-from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion.igso3 import calculate_igso3, Quaternion, quaternion_from_rot_vector
 
 torch.set_printoptions(sci_mode=False)
@@ -585,12 +586,12 @@ class Diffuser:
 
     def diffuse_pose(
         self,
-        xyz,
-        seq,
-        atom_mask,
-        include_motif_sidechains=True,
-        diffusion_mask=None,
-        t_list=None,
+        xyz: Tensor,
+        seq: Iterable[int],
+        atom_mask: BoolTensor,
+        include_motif_sidechains: bool = True,
+        diffusion_mask: BoolTensor | None = None,
+        t_list: list[int] | None = None,
     ):
         """
         Given full atom xyz, sequence and atom mask, diffuse the protein frame
@@ -612,9 +613,8 @@ class Diffuser:
         """
 
         if diffusion_mask is None:
-            diffusion_mask = torch.zeros(len(xyz.squeeze())).to(dtype=bool)
+            diffusion_mask = torch.zeros(len(xyz.squeeze()), device = xyz.device, dtype=bool)
 
-        get_allatom = ComputeAllAtomCoords().to(device=xyz.device)
         L = len(xyz)
 
         # bring to origin and scale
@@ -623,36 +623,29 @@ class Diffuser:
         assert torch.sum(~nan_mask) == 0
 
         # Centre unmasked structure at origin, as in training (to prevent information leak)
-        if torch.sum(diffusion_mask) != 0:
-            self.motif_com = xyz[diffusion_mask, 1, :].mean(
-                dim=0
-            )  # This is needed for one of the potentials
+        if diffusion_mask.any():
+            self.motif_com = xyz[diffusion_mask, 1, :].mean(dim=0)  # This is needed for one of the potentials
             xyz = xyz - self.motif_com
-        elif torch.sum(diffusion_mask) == 0:
+        else:
             xyz = xyz - xyz[:, 1, :].mean(dim=0)
 
         xyz_true = torch.clone(xyz)
         xyz = xyz * self.crd_scale
 
         # 1 get translations
-        tick = time.time()
         diffused_T, deltas = self.eucl_diffuser.diffuse_translations(
             xyz[:, :3, :].clone(), diffusion_mask=diffusion_mask
         )
-        # print('Time to diffuse coordinates: ',time.time()-tick)
         diffused_T /= self.crd_scale
         deltas /= self.crd_scale
 
         # 2 get frames
-        tick = time.time()
         diffused_frame_crds, diffused_frames = self.so3_diffuser.diffuse_frames(
             xyz[:, :3, :].clone(), diffusion_mask=diffusion_mask.numpy(), t_list=None
         )
         diffused_frame_crds /= self.crd_scale
-        # print('Time to diffuse frames: ',time.time()-tick)
 
         ##### Now combine all the diffused quantities to make full atom diffused poses
-        tick = time.time()
         cum_delta = deltas.cumsum(dim=1)
         # The coordinates of the translated AND rotated frames
         diffused_BB = (
@@ -660,7 +653,6 @@ class Diffuser:
         ).transpose(
             0, 1
         )  # [n,L,3,3]
-        # diffused_BB  = torch.from_numpy(diffused_frame_crds).transpose(0,1)
 
         # diffused_BB is [t_steps,L,3,3]
         t_steps, L = diffused_BB.shape[:2]

@@ -1,6 +1,16 @@
+from typing import Any
+
+import os
+import string
+import logging
+
 import torch
+from torch import Tensor, BoolTensor, LongTensor
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
+import torch.nn.functional as nn
+
 from rfdiffusion.RoseTTAFoldModel import RoseTTAFoldModule
 from rfdiffusion.kinematics import get_init_xyz, xyz_to_t2d
 from rfdiffusion.diffusion import Diffuser
@@ -9,22 +19,10 @@ from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion.contigs import ContigMap
 from rfdiffusion.inference import utils as iu, symmetry
 from rfdiffusion.potentials.manager import PotentialManager
-import logging
-import torch.nn.functional as nn
-from rfdiffusion import util
-from hydra.core.hydra_config import HydraConfig
-import os
-import string
-
+from rfdiffusion.util import get_torsions_initialized
 from rfdiffusion.model_input_logger import pickle_function_call
-import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-
-TOR_INDICES = util.torsion_indices
-TOR_CAN_FLIP = util.torsion_can_flip
-REF_ANGLES = util.reference_angles
-
 
 class Sampler:
 
@@ -186,7 +184,7 @@ class Sampler:
             self.t_step_input = int(self.diffuser_conf.T)
 
     @property
-    def T(self):
+    def T(self) -> int:
         """
         Return the maximum number of timesteps
         that this design protocol will perform.
@@ -249,7 +247,7 @@ class Sampler:
                     override.split(".")[1].split("=")[0]
                 ] = mytype(override.split("=")[1])
 
-    def load_model(self):
+    def load_model(self) -> RoseTTAFoldModule:
         """Create RosettaFold model from preloaded checkpoint."""
 
         # Read input dimensions from checkpoint.
@@ -269,27 +267,24 @@ class Sampler:
         model.load_state_dict(self.ckpt["model_state_dict"], strict=True)
         return model
 
-    def construct_contig(self, target_feats):
+    def construct_contig(self, target_feats) -> ContigMap:
         """
         Construct contig class describing the protein to be generated
         """
         self._log.info(f"Using contig: {self.contig_conf.contigs}")
         return ContigMap(target_feats, **self.contig_conf)
 
-    def construct_denoiser(self, L, visible):
+    def construct_denoiser(self, L: int, visible: bool):
         """Make length-specific denoiser."""
-        denoise_kwargs = OmegaConf.to_container(self.diffuser_conf)
-        denoise_kwargs.update(OmegaConf.to_container(self.denoiser_conf))
-        denoise_kwargs.update(
-            {
+        denoise_kwargs: dict[str, Any] = OmegaConf.to_container(self.diffuser_conf) 
+        denoise_kwargs |= {
                 "L": L,
                 "diffuser": self.diffuser,
                 "potential_manager": self.potential_manager,
             }
-        )
         return iu.Denoise(**denoise_kwargs)
 
-    def sample_init(self, return_forward_trajectory=False):
+    def sample_init(self, return_forward_trajectory: bool = False) -> tuple[Tensor, Tensor]:
         """
         Initial features to start the sampling process.
 
@@ -520,8 +515,6 @@ class Sampler:
                 xyz_motif_prealign = xyz_motif_prealign[0, 0][
                     self.diffusion_mask.squeeze()
                 ]
-                motif_prealign_com = xyz_motif_prealign[:, 1].mean(dim=0)
-                xyz_het_com = xyz_het.mean(dim=0)
                 for pot in self.potential_manager.potentials_to_apply:
                     pot.motif_substrate_atoms = xyz_het
                     pot.diffusion_mask = self.diffusion_mask.squeeze()
@@ -529,7 +522,7 @@ class Sampler:
                     pot.diffuser = self.diffuser
         return xt, seq_t
 
-    def _init_cyclic_reses(self, mask_str, contig_map):
+    def _init_cyclic_reses(self, mask_str: BoolTensor, contig_map: ContigMap):
         """
         Centralized logic for initializing self.cyclic_reses.
 
@@ -563,7 +556,13 @@ class Sampler:
         else:
             self.cyclic_reses = torch.zeros_like(mask).bool().to(self.device).squeeze()
 
-    def _preprocess(self, seq, xyz_t, t, repack=False):
+    def _preprocess(
+        self, 
+        seq: Tensor, 
+        xyz_t: Tensor, 
+        t: LongTensor, 
+        repack: bool = False,
+        ) -> tuple[Tensor,Tensor,Tensor,Tensor,LongTensor,Tensor,Tensor,Tensor,Tensor]:
         """
         Function to prepare inputs to diffusion model
 
@@ -589,9 +588,6 @@ class Sampler:
         """
 
         L = seq.shape[0]
-        T = self.T
-        binderlen = self.binderlen
-        target_res = self.ppi_conf.hotspot_res
 
         ##################
         ### msa_masked ###
@@ -658,9 +654,7 @@ class Sampler:
         ### alpha_t ###
         ###############
         seq_tmp = t1d[..., :-1].argmax(dim=-1).reshape(-1, L)
-        alpha, _, alpha_mask, _ = util.get_torsions(
-            xyz_t.reshape(-1, L, 27, 3), seq_tmp, TOR_INDICES, TOR_CAN_FLIP, REF_ANGLES
-        )
+        alpha, _, alpha_mask, _ = get_torsions_initialized(xyz_t.reshape(-1, L, 27, 3), seq_tmp)
         alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[..., 0]))
         alpha[torch.isnan(alpha)] = 0.0
         alpha = alpha.reshape(1, -1, L, 10, 2)
@@ -718,7 +712,7 @@ class Sampler:
             alpha_t,
         )
 
-    def sample_step(self, *, t, x_t, seq_init, final_step):
+    def sample_step(self, *, t: int, x_t: Tensor, seq_init: Tensor, final_step: int) -> tuple[Tensor,Tensor,Tensor,Tensor]:
         """Generate the next pose that the model should be supplied at timestep t-1.
 
         Args:
@@ -731,21 +725,14 @@ class Sampler:
             px0: (L,14,3) The model's prediction of x0.
             x_t_1: (L,14,3) The updated positions of the next step.
             seq_t_1: (L,22) The updated sequence of the next step.
-            tors_t_1: (L, ?) The updated torsion angles of the next  step.
             plddt: (L, 1) Predicted lDDT of x0.
         """
         msa_masked, msa_full, seq_in, xt_in, idx_pdb, t1d, t2d, xyz_t, alpha_t = (
             self._preprocess(seq_init, x_t, t)
         )
 
-        N, L = msa_masked.shape[:2]
-
         if self.symmetry is not None:
             idx_pdb, self.chain_idx = self.symmetry.res_idx_procesing(res_idx=idx_pdb)
-
-        msa_prev = None
-        pair_prev = None
-        state_prev = None
 
         with torch.no_grad():
             msa_prev, pair_prev, px0, state_prev, alpha, logits, plddt = self.model(
@@ -758,9 +745,9 @@ class Sampler:
                 t2d=t2d,
                 xyz_t=xyz_t,
                 alpha_t=alpha_t,
-                msa_prev=msa_prev,
-                pair_prev=pair_prev,
-                state_prev=state_prev,
+                msa_prev=None,
+                pair_prev=None,
+                state_prev=None,
                 t=torch.tensor(t),
                 return_infer=True,
                 motif_mask=self.diffusion_mask.squeeze().to(self.device),
@@ -800,7 +787,7 @@ class SelfConditioning(Sampler):
     pX0[t+1] is provided as a template input to the model at time t
     """
 
-    def sample_step(self, *, t, x_t, seq_init, final_step):
+    def sample_step(self, *, t: int, x_t: Tensor, seq_init: Tensor, final_step: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Generate the next pose that the model should be supplied at timestep t-1.
         Args:
@@ -1156,7 +1143,12 @@ class ScaffoldedSampler(SelfConditioning):
 
         return xT, seq_T
 
-    def _preprocess(self, seq, xyz_t, t):
+    def _preprocess(
+        self, 
+        seq, 
+        xyz_t: Tensor, 
+        t: LongTensor
+        ) -> tuple[Tensor,Tensor,Tensor,Tensor,LongTensor,Tensor,Tensor,Tensor,Tensor]:
         msa_masked, msa_full, seq, xyz_prev, idx_pdb, t1d, t2d, xyz_t, alpha_t = (
             super()._preprocess(seq, xyz_t, t, repack=False)
         )
