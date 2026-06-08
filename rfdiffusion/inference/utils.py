@@ -16,8 +16,6 @@ from rfdiffusion.diffusion import get_beta_schedule, Diffuser
 from rfdiffusion.util import rigid_from_3_points
 from rfdiffusion import util
 
-from rfdiffusion.inference import model_runners
-
 ###########################################################
 #### Functions which can be called outside of Denoiser ####
 ###########################################################
@@ -476,20 +474,6 @@ class Denoise:
             fullatom_next[:, diffusion_mask, :14] = xt[None, diffusion_mask]
 
         return fullatom_next.squeeze()[:, :14, :], px0
-
-
-def sampler_selector(conf: DictConfig) -> model_runners.Sampler:
-    if conf.scaffoldguided.scaffoldguided:
-        return model_runners.ScaffoldedSampler(conf)
-    match conf.inference.model_runner:
-        case "default":
-            return model_runners.Sampler(conf)
-        case "SelfConditioning":
-            return model_runners.SelfConditioning(conf)
-        case "ScaffoldedSampler":
-            return model_runners.ScaffoldedSampler(conf)
-        case _ as sampler:
-            raise ValueError(f"Unrecognized sampler {sampler}")
 
 
 def parse_pdb(filename: str, **kwargs) -> dict[str, Any]:

@@ -17,10 +17,12 @@ from rfdiffusion.diffusion import Diffuser
 from rfdiffusion.chemical import seq2chars
 from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion.contigs import ContigMap
-from rfdiffusion.inference import utils as iu, symmetry
 from rfdiffusion.potentials.manager import PotentialManager
 from rfdiffusion.util import get_torsions_initialized
 from rfdiffusion.model_input_logger import pickle_function_call
+
+from rfdiffusion.inference.symmetry import SymGen
+from rfdiffusion.inference.utils import Denoise, Target, BlockAdjacency, process_target, get_idx0_hotspots, ss_from_contig
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
@@ -150,7 +152,7 @@ class Sampler:
         ###########################
 
         if self.inf_conf.symmetry is not None:
-            self.symmetry = symmetry.SymGen(
+            self.symmetry = SymGen(
                 self.inf_conf.symmetry,
                 self.inf_conf.recenter,
                 self.inf_conf.radius,
@@ -167,7 +169,7 @@ class Sampler:
             self.inf_conf.input_pdb = os.path.join(
                 script_dir, "../../examples/input_pdbs/1qys.pdb"
             )
-        self.target_feats = iu.process_target(
+        self.target_feats = process_target(
             self.inf_conf.input_pdb, parse_hetatom=True, center=False
         )
         self.chain_idx = None
@@ -282,7 +284,7 @@ class Sampler:
                 "diffuser": self.diffuser,
                 "potential_manager": self.potential_manager,
             }
-        return iu.Denoise(**denoise_kwargs)
+        return Denoise(**denoise_kwargs)
 
     def sample_init(self, return_forward_trajectory: bool = False) -> tuple[Tensor, Tensor]:
         """
@@ -300,7 +302,7 @@ class Sampler:
         ### Parse input pdb ###
         #######################
 
-        self.target_feats = iu.process_target(
+        self.target_feats = process_target(
             self.inf_conf.input_pdb, parse_hetatom=True, center=False
         )
 
@@ -324,7 +326,7 @@ class Sampler:
         ### Get Hotspots ###
         ####################
 
-        self.hotspot_0idx = iu.get_idx0_hotspots(
+        self.hotspot_0idx = get_idx0_hotspots(
             self.mappings, self.ppi_conf, self.binderlen
         )
 
@@ -943,14 +945,14 @@ class ScaffoldedSampler(SelfConditioning):
                     conf.contigmap.inpaint_str_loop,
                 )
             ), "can't provide scaffold_dir if you're also specifying per-residue ss"
-            self.blockadjacency = iu.BlockAdjacency(conf, conf.inference.num_designs)
+            self.blockadjacency = BlockAdjacency(conf, conf.inference.num_designs)
 
         #################################################
         ### Initialize target, if doing binder design ###
         #################################################
 
         if conf.scaffoldguided.target_pdb:
-            self.target = iu.Target(conf.scaffoldguided, conf.ppi.hotspot_res)
+            self.target = Target(conf.scaffoldguided, conf.ppi.hotspot_res)
             self.target_pdb = self.target.get_target()
             if conf.scaffoldguided.target_ss is not None:
                 self.target_ss = torch.load(conf.scaffoldguided.target_ss).long()
@@ -1052,7 +1054,7 @@ class ScaffoldedSampler(SelfConditioning):
             ), "Giving a target is the wrong way of handling this is you're doing contigs and secondary structure"
 
             # process target and reinitialise potential_manager. This is here because the 'target' is always set up to be the second chain in out inputs.
-            self.target_feats = iu.process_target(self.inf_conf.input_pdb)
+            self.target_feats = process_target(self.inf_conf.input_pdb)
             self.contig_map = self.construct_contig(self.target_feats)
             self.mappings = self.contig_map.get_mappings()
             self.mask_seq = torch.from_numpy(self.contig_map.inpaint_seq)[None, :]
@@ -1082,13 +1084,13 @@ class ScaffoldedSampler(SelfConditioning):
             if hasattr(self.contig_map, "ss_spec"):
                 self.adj = torch.full((L_mapped, L_mapped), 2)  # masked
                 self.adj = nn.one_hot(self.adj.long(), num_classes=3)
-                self.ss = iu.ss_from_contig(self.contig_map.ss_spec)
+                self.ss = ss_from_contig(self.contig_map.ss_spec)
             assert L_mapped == self.adj.shape[0]
 
         ####################
         ### Get hotspots ###
         ####################
-        self.hotspot_0idx = iu.get_idx0_hotspots(
+        self.hotspot_0idx = get_idx0_hotspots(
             self.mappings, self.ppi_conf, self.binderlen
         )
 
@@ -1204,3 +1206,17 @@ class ScaffoldedSampler(SelfConditioning):
             idx_pdb[:, self.binderlen :] += 200
 
         return msa_masked, msa_full, seq, xyz_prev, idx_pdb, t1d, t2d, xyz_t, alpha_t
+
+
+def sampler_selector(conf: DictConfig) -> Sampler:
+    if conf.scaffoldguided.scaffoldguided:
+        return ScaffoldedSampler(conf)
+    match conf.inference.model_runner:
+        case "default":
+            return Sampler(conf)
+        case "SelfConditioning":
+            return SelfConditioning(conf)
+        case "ScaffoldedSampler":
+            return ScaffoldedSampler(conf)
+        case _ as sampler:
+            raise ValueError(f"Unrecognized sampler {sampler}")

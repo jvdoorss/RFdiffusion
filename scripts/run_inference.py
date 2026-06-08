@@ -17,16 +17,18 @@ See https://hydra.cc/docs/advanced/hydra-command-line-flags/ for more options.
 
 import re
 import os, time, pickle
+import logging
+import random
+import glob
+
 import torch
 from omegaconf import OmegaConf
 import hydra
-import logging
-from rfdiffusion.util import writepdb_multi, writepdb
-from rfdiffusion.inference import utils as iu
 from hydra.core.hydra_config import HydraConfig
 import numpy as np
-import random
-import glob
+
+from rfdiffusion.util import writepdb_multi, writepdb
+from rfdiffusion.inference.model_runners import sampler_selector
 
 torch.set_float32_matmul_precision('high')
 
@@ -53,7 +55,7 @@ def main(conf: HydraConfig) -> None:
         log.info("////////////////////////////////////////////////")
 
     # Initialize sampler and target/contig.
-    sampler = iu.sampler_selector(conf)
+    sampler = sampler_selector(conf)
 
     # Loop over number of designs to sample.
     design_startnum = sampler.inf_conf.design_startnum
