@@ -202,7 +202,7 @@ class ScaffoldedSampler(SelfConditioning):
                     self.target_adj = self.target_adj[:, self.target_pdb["crop_mask"]]
         else:
             self.target = None
-            self.target_pdb = False
+            self.target_pdb = None
 
     def sample_init(self):
         """

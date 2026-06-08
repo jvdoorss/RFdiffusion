@@ -1,8 +1,8 @@
 from typing import Any
 
-import os
 import string
 import logging
+from pathlib import Path
 
 import torch
 from torch import Tensor, BoolTensor, LongTensor
@@ -24,7 +24,10 @@ from rfdiffusion.model_input_logger import pickle_function_call
 from rfdiffusion.inference.symmetry import SymGen
 from rfdiffusion.inference.utils import Denoise,process_target, get_idx0_hotspots
 
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__)) + '/..'
+PACKAGE_DIR = Path(__file__).parents[3]
+EXAMPLES_DIR = PACKAGE_DIR / "examples"
+MODELS_DIR = PACKAGE_DIR / "models"
+SCHEDULES_DIR = PACKAGE_DIR / "schedules"
 
 class Sampler:
 
@@ -66,9 +69,9 @@ class Sampler:
         ################################
 
         if conf.inference.model_directory_path is not None:
-            model_directory = conf.inference.model_directory_path
+            model_directory = Path(conf.inference.model_directory_path)
         else:
-            model_directory = f"{SCRIPT_DIR}/../../models"
+            model_directory = MODELS_DIR
 
         print(f"Reading models from {model_directory}")
 
@@ -91,21 +94,21 @@ class Sampler:
                         conf.diffuser.partial_T is not None
                     ), "The provide_seq input is specifically for partial diffusion"
                 if conf.scaffoldguided.scaffoldguided:
-                    self.ckpt_path = f"{model_directory}/InpaintSeq_Fold_ckpt.pt"
+                    self.ckpt_path = model_directory / "InpaintSeq_Fold_ckpt.pt"
                 else:
-                    self.ckpt_path = f"{model_directory}/InpaintSeq_ckpt.pt"
+                    self.ckpt_path = model_directory / "InpaintSeq_ckpt.pt"
             elif (
                 conf.ppi.hotspot_res is not None
-                and conf.scaffoldguided.scaffoldguided is False
+                and not conf.scaffoldguided.scaffoldguided
             ):
                 # use complex trained model
-                self.ckpt_path = f"{model_directory}/Complex_base_ckpt.pt"
-            elif conf.scaffoldguided.scaffoldguided is True:
+                self.ckpt_path = model_directory / "Complex_base_ckpt.pt"
+            elif conf.scaffoldguided.scaffoldguided:
                 # use complex and secondary structure-guided model
-                self.ckpt_path = f"{model_directory}/Complex_Fold_base_ckpt.pt"
+                self.ckpt_path = model_directory / "Complex_Fold_base_ckpt.pt"
             else:
                 # use default model
-                self.ckpt_path = f"{model_directory}/Base_ckpt.pt"
+                self.ckpt_path = model_directory / "Base_ckpt.pt"
         # for saving in trb file:
         assert (
             self._conf.inference.trb_save_ckpt_path is None
@@ -138,14 +141,14 @@ class Sampler:
         self.preprocess_conf = self._conf.preprocess
 
         if conf.inference.schedule_directory_path is not None:
-            schedule_directory = conf.inference.schedule_directory_path
+            schedule_directory = Path(conf.inference.schedule_directory_path)
         else:
-            schedule_directory = f"{SCRIPT_DIR}/../../schedules"
+            schedule_directory = SCHEDULES_DIR
 
         # Check for cache schedule
-        if not os.path.exists(schedule_directory):
-            os.mkdir(schedule_directory)
-        self.diffuser = Diffuser(**self._conf.diffuser, cache_dir=schedule_directory)
+        if not schedule_directory.exists():
+            schedule_directory.mkdir()
+        self.diffuser = Diffuser(**self._conf.diffuser, cache_dir=str(schedule_directory))
 
         ###########################
         ### Initialise Symmetry ###
@@ -165,9 +168,7 @@ class Sampler:
 
         if self.inf_conf.input_pdb is None:
             # set default pdb
-            self.inf_conf.input_pdb = os.path.join(
-                SCRIPT_DIR, "../../examples/input_pdbs/1qys.pdb"
-            )
+            self.inf_conf.input_pdb = str(EXAMPLES_DIR / "input_pdbs" / "1qys.pdb")
         self.target_feats = process_target(
             self.inf_conf.input_pdb, parse_hetatom=True, center=False
         )

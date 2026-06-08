@@ -814,7 +814,7 @@ class BlockAdjacency:
 
         return ss, adj
 
-    def get_scaffold(self) -> tuple[int, Tensor]:
+    def get_scaffold(self) -> tuple[int, Tensor, Tensor]:
         """
         Wrapper method for pulling an item from the list, and preparing ss and block adj features
         """
