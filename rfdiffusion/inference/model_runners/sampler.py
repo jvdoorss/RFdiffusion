@@ -756,7 +756,7 @@ class Sampler:
             )
 
         # prediction of X0
-        _, px0 = self.allatom(torch.argmax(seq_in, dim=-1), px0, alpha)
+        _, px0 = self.allatom.forward(torch.argmax(seq_in, dim=-1), px0, alpha)
         px0 = px0.squeeze()[:, :14]
 
         #####################
@@ -773,7 +773,7 @@ class Sampler:
                 align_motif=self.inf_conf.align_motif,
             )
         else:
-            x_t_1 = torch.clone(px0).to(x_t.device)
+            x_t_1 = px0.to(x_t.device, copy=True)
             seq_t_1 = torch.clone(seq_init)
             px0 = px0.to(x_t.device)
 

@@ -88,21 +88,20 @@ def main(conf: HydraConfig) -> None:
 
         sample_runner = SamplerWrapper(sampler)
 
-        px0_xyz_stack, denoised_xyz_stack, seq_stack, plddt_stack = sample_runner.run()
+        px0_xyz_stack, denoised_xyz_stack, _, plddt_stack = sample_runner.run()
         seq_init = sample_runner.seq_init
 
         # Save outputs
         os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
-        final_seq = seq_stack[-1]
 
         # Output glycines, except for motif region
-        final_seq = torch.where(
-            torch.argmax(seq_init, dim=-1) == 21, 7, torch.argmax(seq_init, dim=-1)
-        )  # 7 is glycine
+        final_seq = torch.argmax(seq_init, dim=-1)
+        non_motif = final_seq == 21 
+        final_seq[non_motif] = 7 # 7 is glycine
 
         bfacts = torch.ones_like(final_seq.squeeze())
         # make bfact=0 for diffused coordinates
-        bfacts[torch.where(torch.argmax(seq_init, dim=-1) == 21, True, False)] = 0
+        bfacts[non_motif] = 0
         # pX0 last step
         out = f"{out_prefix}.pdb"
 
