@@ -4,6 +4,7 @@ from omegaconf import DictConfig
 
 from .sampler import Sampler
 from .scaffolded_sampler import ScaffoldedSampler, SelfConditioning
+from .runner import SamplerWrapper
 
 def sampler_selector(conf: DictConfig) -> Sampler:
     if conf.scaffoldguided.scaffoldguided:

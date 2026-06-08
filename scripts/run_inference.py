@@ -28,7 +28,8 @@ from hydra.core.hydra_config import HydraConfig
 import numpy as np
 
 from rfdiffusion.util import writepdb_multi, writepdb
-from rfdiffusion.inference.model_runners import sampler_selector
+from rfdiffusion.inference.model_runners import sampler_selector, SamplerWrapper
+
 
 torch.set_float32_matmul_precision('high')
 
@@ -85,42 +86,10 @@ def main(conf: HydraConfig) -> None:
             )
             continue
 
-        x_init, seq_init = sampler.sample_init()
-        denoised_xyz_stack = []
-        px0_xyz_stack = []
-        seq_stack = []
-        plddt_stack = []
+        sample_runner = SamplerWrapper(sampler)
 
-        x_t = torch.clone(x_init)
-        seq_t = torch.clone(seq_init)
-        # Loop over number of reverse diffusion time steps.
-        for t in range(int(sampler.t_step_input), sampler.inf_conf.final_step - 1, -1):
-            px0, x_t, seq_t, plddt = sampler.sample_step(
-                t=t, x_t=x_t, seq_init=seq_t, final_step=sampler.inf_conf.final_step
-            )
-            px0_xyz_stack.append(px0)
-            denoised_xyz_stack.append(x_t)
-            seq_stack.append(seq_t)
-            plddt_stack.append(plddt[0])  # remove singleton leading dimension
-
-        # Flip order for better visualization in pymol
-        denoised_xyz_stack = torch.stack(denoised_xyz_stack)
-        denoised_xyz_stack = torch.flip(
-            denoised_xyz_stack,
-            [
-                0,
-            ],
-        )
-        px0_xyz_stack = torch.stack(px0_xyz_stack)
-        px0_xyz_stack = torch.flip(
-            px0_xyz_stack,
-            [
-                0,
-            ],
-        )
-
-        # For logging -- don't flip
-        plddt_stack = torch.stack(plddt_stack)
+        px0_xyz_stack, denoised_xyz_stack, seq_stack, plddt_stack = sample_runner.run()
+        seq_init = sample_runner.seq_init
 
         # Save outputs
         os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
