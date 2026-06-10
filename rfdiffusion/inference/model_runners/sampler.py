@@ -1,15 +1,16 @@
-from typing import Any
+from typing import Any, Literal
 
 import string
 import logging
 from pathlib import Path
+from functools import lru_cache
 
 import torch
 from torch import Tensor, BoolTensor, LongTensor
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
-import torch.nn.functional as nn
+from torch.nn.functional import one_hot
 
 from rfdiffusion.RoseTTAFoldModel import RoseTTAFoldModule
 from rfdiffusion.kinematics import get_init_xyz, xyz_to_t2d
@@ -28,6 +29,21 @@ PACKAGE_DIR = Path(__file__).parents[3]
 EXAMPLES_DIR = PACKAGE_DIR / "examples"
 MODELS_DIR = PACKAGE_DIR / "models"
 SCHEDULES_DIR = PACKAGE_DIR / "schedules"
+
+@lru_cache()
+def get_msa(seq: torch.Tensor, mode: Literal['full','masked']) -> torch.Tensor:
+        '''Extend a sequence respresentation from a one-hot sequence'''
+        appendix = seq.new_zeros(seq.shape[0],4)
+        appendix[0,2] = 1.0
+        appendix[-1,3] = 1.0
+
+        match mode:
+            case 'masked':
+                return torch.cat([seq,seq,appendix],dim=-1).reshape(1,1,-1,48) # 22 + 22 + 4 cols
+            case 'full':
+                appendix = appendix[:,1:]
+                return torch.cat([seq,appendix],dim=-1).reshape(1,1,-1,25) # 22 + 3 cols
+
 
 class Sampler:
 
@@ -50,7 +66,7 @@ class Sampler:
         - Assembles Config from model checkpoint and command line overrides
 
         """
-        self._log = logging.getLogger(__name__)
+        self._log = logging.getLogger('sampler')
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         else:
@@ -456,8 +472,8 @@ class Sampler:
             seq_t[self.mask_seq.squeeze()] = seq_orig[self.mask_seq.squeeze()]
 
         seq_t[~self.mask_seq.squeeze()] = 21
-        seq_t = torch.nn.functional.one_hot(seq_t, num_classes=22).float()  # [L,22]
-        seq_orig = torch.nn.functional.one_hot(
+        seq_t = one_hot(seq_t, num_classes=22).float()  # [L,22]
+        seq_orig = one_hot(
             seq_orig, num_classes=22
         ).float()  # [L,22]
 
@@ -558,6 +574,73 @@ class Sampler:
         else:
             self.cyclic_reses = torch.zeros_like(mask).bool().to(self.device).squeeze()
 
+    def get_t1d(self, seq: Tensor, t: int | LongTensor) -> Tensor:
+        seqt1d = torch.clone(seq)
+        seqt1d[:,20] += seqt1d[:,21]
+        t1d = seqt1d[:,:21].reshape(1,1,-1,21)
+
+        # Set timestep feature to 1 where diffusion mask is True, else 1-t/T
+        timefeature = seq.new_zeros(seq.shape[0])
+        timefeature[self.mask_str.squeeze()] = 1
+        timefeature[~self.mask_str.squeeze()] = 1 - t / self.T
+        timefeature = timefeature[None, None, ..., None]
+
+        return torch.cat((t1d, timefeature), dim=-1)
+
+    def prepare_xyz(self, seq: Tensor, xyz_t: Tensor) -> Tensor:
+        if self.preprocess_conf.sidechain_input:
+            xyz_t[torch.where(seq == 21, True, False), 3:, :] = float("nan")
+        else:
+            xyz_t[~self.mask_str.squeeze(), 3:, :] = float("nan")
+
+        xyz_t = xyz_t[None, None]
+        nan_tensor = xyz_t.new_full((1, 1, seq.shape[0], 13, 3), float("nan"))
+        return torch.cat((xyz_t, nan_tensor), dim=3)
+
+    def get_alpha(self, t1d: Tensor, xyz_t: Tensor) -> Tensor:
+        L = t1d.shape[-2]
+        seq_tmp = t1d[..., :-1].argmax(dim=-1).reshape(-1, L)
+        alpha, _, alpha_mask, _ = get_torsions_initialized(xyz_t.reshape(-1, L, 27, 3), seq_tmp)
+        alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[..., 0]))
+        alpha[torch.isnan(alpha)] = 0.0
+        alpha = alpha.reshape(1, -1, L, 10, 2)
+        alpha_mask = alpha_mask.reshape(1, -1, L, 10, 1)
+        return torch.cat((alpha, alpha_mask), dim=-1).reshape(1, -1, L, 30)
+
+    @lru_cache
+    def get_idx(self) -> Tensor:
+        return torch.tensor(self.contig_map.rf, device = self.device)[None]
+
+    def add_t1d_features(self, t1d: Tensor) -> Tensor:
+        if self.preprocess_conf.d_t1d < 24:  # don't add hotspot residues
+            return t1d
+        
+        L = t1d.shape[-2]
+        hotspot_tens = t1d.new_zeros(L).float()
+        if self.ppi_conf.hotspot_res is None:
+            print(
+                "WARNING: you're using a model trained on complexes and hotspot residues, without specifying hotspots.\
+                        If you're doing monomer diffusion this is fine"
+            )
+            hotspot_idx = []
+        else:
+            hotspots = [(i[0], int(i[1:])) for i in self.ppi_conf.hotspot_res]
+            hotspot_idx = []
+            for i, res in enumerate(self.contig_map.con_ref_pdb_idx):
+                if res in hotspots:
+                    hotspot_idx.append(self.contig_map.hal_idx0[i])
+            hotspot_tens[hotspot_idx] = 1.0
+
+        # Add blank (legacy) feature and hotspot tensor
+        return torch.cat(
+            (
+                t1d,
+                torch.zeros_like(t1d[..., :1]),
+                hotspot_tens[None, None, ..., None],
+            ),
+            dim=-1,
+        )
+
     def _preprocess(
         self, 
         seq: Tensor, 
@@ -589,124 +672,31 @@ class Sampler:
                 - last plane is block adjacency
         """
 
-        L = seq.shape[0]
-
-        ##################
-        ### msa_masked ###
-        ##################
-        msa_masked = torch.zeros((1, 1, L, 48))
-        msa_masked[:, :, :, :22] = seq[None, None]
-        msa_masked[:, :, :, 22:44] = seq[None, None]
-        msa_masked[:, :, 0, 46] = 1.0
-        msa_masked[:, :, -1, 47] = 1.0
-
-        ################
-        ### msa_full ###
-        ################
-        msa_full = torch.zeros((1, 1, L, 25))
-        msa_full[:, :, :, :22] = seq[None, None]
-        msa_full[:, :, 0, 23] = 1.0
-        msa_full[:, :, -1, 24] = 1.0
-
-        ###########
-        ### t1d ###
-        ###########
-
-        # Here we need to go from one hot with 22 classes to one hot with 21 classes (last plane is missing token)
-        t1d = torch.zeros((1, 1, L, 21))
-
-        seqt1d = torch.clone(seq)
-        for idx in range(L):
-            if seqt1d[idx, 21] == 1:
-                seqt1d[idx, 20] = 1
-                seqt1d[idx, 21] = 0
-
-        t1d[:, :, :, :21] = seqt1d[None, None, :, :21]
-
-        # Set timestep feature to 1 where diffusion mask is True, else 1-t/T
-        timefeature = torch.zeros((L)).float()
-        timefeature[self.mask_str.squeeze()] = 1
-        timefeature[~self.mask_str.squeeze()] = 1 - t / self.T
-        timefeature = timefeature[None, None, ..., None]
-
-        t1d = torch.cat((t1d, timefeature), dim=-1).float()
-
-        #############
-        ### xyz_t ###
-        #############
-        if self.preprocess_conf.sidechain_input:
-            xyz_t[torch.where(seq == 21, True, False), 3:, :] = float("nan")
-        else:
-            xyz_t[~self.mask_str.squeeze(), 3:, :] = float("nan")
-
-        xyz_t = xyz_t[None, None]
-        xyz_t = torch.cat((xyz_t, torch.full((1, 1, L, 13, 3), float("nan"))), dim=3)
-
-        ###########
-        ### t2d ###
-        ###########
-        t2d = xyz_to_t2d(xyz_t)
-
-        ###########
-        ### idx ###
-        ###########
-        idx = torch.tensor(self.contig_map.rf)[None]
-
-        ###############
-        ### alpha_t ###
-        ###############
-        seq_tmp = t1d[..., :-1].argmax(dim=-1).reshape(-1, L)
-        alpha, _, alpha_mask, _ = get_torsions_initialized(xyz_t.reshape(-1, L, 27, 3), seq_tmp)
-        alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[..., 0]))
-        alpha[torch.isnan(alpha)] = 0.0
-        alpha = alpha.reshape(1, -1, L, 10, 2)
-        alpha_mask = alpha_mask.reshape(1, -1, L, 10, 1)
-        alpha_t = torch.cat((alpha, alpha_mask), dim=-1).reshape(1, -1, L, 30)
-
-        # put tensors on device
-        msa_masked = msa_masked.to(self.device)
-        msa_full = msa_full.to(self.device)
         seq = seq.to(self.device)
         xyz_t = xyz_t.to(self.device)
-        idx = idx.to(self.device)
-        t1d = t1d.to(self.device)
-        t2d = t2d.to(self.device)
-        alpha_t = alpha_t.to(self.device)
 
-        ######################
-        ### added_features ###
-        ######################
-        if self.preprocess_conf.d_t1d >= 24:  # add hotspot residues
-            hotspot_tens = torch.zeros(L).float()
-            if self.ppi_conf.hotspot_res is None:
-                print(
-                    "WARNING: you're using a model trained on complexes and hotspot residues, without specifying hotspots.\
-                         If you're doing monomer diffusion this is fine"
-                )
-                hotspot_idx = []
-            else:
-                hotspots = [(i[0], int(i[1:])) for i in self.ppi_conf.hotspot_res]
-                hotspot_idx = []
-                for i, res in enumerate(self.contig_map.con_ref_pdb_idx):
-                    if res in hotspots:
-                        hotspot_idx.append(self.contig_map.hal_idx0[i])
-                hotspot_tens[hotspot_idx] = 1.0
+        L = seq.shape[0]
 
-            # Add blank (legacy) feature and hotspot tensor
-            t1d = torch.cat(
-                (
-                    t1d,
-                    torch.zeros_like(t1d[..., :1]),
-                    hotspot_tens[None, None, ..., None].to(self.device),
-                ),
-                dim=-1,
-            )
+        msa_masked = get_msa(seq,'masked')
+        msa_full = get_msa(seq,'full')
+
+        t1d = self.get_t1d(seq, t)
+
+        xyz_t = self.prepare_xyz(seq, xyz_t)
+
+        t2d = xyz_to_t2d(xyz_t)
+
+        idx = self.get_idx()
+
+        alpha_t = self.get_alpha(t1d,xyz_t)
+
+        t1d = self.add_t1d_features(t1d)
 
         return (
             msa_masked,
             msa_full,
-            seq[None],
-            torch.squeeze(xyz_t, dim=0),
+            seq.unsqueeze(0),
+            xyz_t.squeeze(0),
             idx,
             t1d,
             t2d,
@@ -764,7 +754,7 @@ class Sampler:
         #####################
 
         if t > final_step:
-            seq_t_1 = nn.one_hot(seq_init, num_classes=22).to(self.device)
+            seq_t_1 = one_hot(seq_init, num_classes=22).to(self.device)
             x_t_1, px0 = self.denoiser.get_next_pose(
                 xt=x_t,
                 px0=px0,

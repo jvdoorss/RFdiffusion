@@ -749,5 +749,9 @@ def get_torsions_initialized(   xyz_in: torch.Tensor,
                                 reference_angles: torch.Tensor = reference_angles,
                                 mask_in: torch.BoolTensor | None = None) -> tuple[torch.Tensor,torch.Tensor, torch.Tensor, torch.Tensor]:
     '''Get torsions with initialized residue properties'''
+    if torsion_indices.device != xyz_in.device:
+        torsion_indices = torsion_indices.to(xyz_in.device)
+        torsion_can_flip = torsion_can_flip.to(xyz_in.device)
+        reference_angles = reference_angles.to(xyz_in.device)
     return get_torsions(xyz_in, seq, torsion_indices, torsion_can_flip, reference_angles, mask_in)
 
