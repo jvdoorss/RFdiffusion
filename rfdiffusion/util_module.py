@@ -8,11 +8,14 @@ from rfdiffusion.util import base_indices, RTs_by_torsion, xyzs_in_base_frame, r
 
 from se3_transformer.graph import Graph
 
-def find_breaks(ix, thresh=35):
-    # finds positions in ix where the jump is greater than 100
-    breaks = np.where(np.diff(ix) > thresh)[0]
-    return np.array(breaks)+1
+def find_breaks(ix: torch.Tensor, thresh: float = 35) -> torch.LongTensor:
+    '''finds positions in ix where the jump is greater than thresh'''
+    jumps, = torch.nonzero(ix.diff() > thresh, as_tuple = True) 
+    return jumps + 1
 
+def find_chainids(ix: torch.Tensor, thresh: float = 35) -> torch.LongTensor:
+    '''Return numbering of clusters separated by gap thresh. ix assumed monotonically ascending.'''
+    return (ix.diff(dim = 0, prepend = ix[:1]) > thresh).long().cumsum(dim=0)
 
 def init_lecun_normal(module):
     def truncated_normal(uniform, mu=0.0, sigma=1.0, a=-2, b=2):
@@ -102,6 +105,7 @@ def get_seqsep(idx, cyclic=None):
     '''
     Input:
         - idx: residue indices of given sequence (B,L)
+
     Output:
         - seqsep: sequence separation feature with sign (B, L, L, 1)
                   Sergey found that having sign in seqsep features helps a little
@@ -113,11 +117,7 @@ def get_seqsep(idx, cyclic=None):
     neigh = sign * neigh
 
     # add cyclic edges
-    breaks = find_breaks(idx.squeeze().cpu().numpy())
-    chainids = np.zeros_like(idx.squeeze().cpu().numpy())
-    for i, b in enumerate(breaks):
-        chainids[b:] = i+1
-    chainids = torch.from_numpy(chainids).to(device=idx.device)
+    chainids = find_chainids(idx.squeeze())
 
     # add cyclic edges with multiple chains
     if (cyclic is not None):
