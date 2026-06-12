@@ -1,12 +1,10 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from opt_einsum import contract as einsum
-import copy
+from se3_transformer.graph import Graph
+
 from rfdiffusion.util import base_indices, RTs_by_torsion, xyzs_in_base_frame, rigid_from_3_points
 
-from se3_transformer.graph import Graph
 
 def find_breaks(ix: torch.Tensor, thresh: float = 35) -> torch.LongTensor:
     '''finds positions in ix where the jump is greater than thresh'''
@@ -68,9 +66,6 @@ def create_custom_forward(module, **kwargs):
     def custom_forward(*inputs):
         return module(*inputs, **kwargs)
     return custom_forward
-
-def get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 class Dropout(nn.Module):
     # Dropout entire row or column
@@ -247,9 +242,9 @@ class ComputeAllAtomCoords(nn.Module):
     def __init__(self):
         super(ComputeAllAtomCoords, self).__init__()
 
-        self.base_indices = nn.Parameter(base_indices, requires_grad=False)
-        self.RTs_in_base_frame = nn.Parameter(RTs_by_torsion, requires_grad=False)
-        self.xyzs_in_base_frame = nn.Parameter(xyzs_in_base_frame, requires_grad=False)
+        self.base_indices = nn.Parameter(base_indices(), requires_grad=False)
+        self.RTs_in_base_frame = nn.Parameter(RTs_by_torsion(), requires_grad=False)
+        self.xyzs_in_base_frame = nn.Parameter(xyzs_in_base_frame(), requires_grad=False)
 
     def forward(self, seq, xyz, alphas, non_ideal=False, use_H=True):
         B,L = xyz.shape[:2]
