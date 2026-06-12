@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-from rfdiffusion.util_module import Dropout, create_custom_forward, rbf, init_lecun_normal, find_chainids
-from rfdiffusion.Attention_module import Attention, FeedForwardLayer, AttentionWithBias
-from rfdiffusion.Track_module import PairStr2Pair
+from .util_module import Dropout, create_custom_forward, rbf, init_lecun_normal, find_chainids
+from .Attention_module import Attention, FeedForwardLayer, AttentionWithBias
+from .Track_module import PairStr2Pair
 
 # Module contains classes and functions to generate initial embeddings
 

@@ -5,9 +5,10 @@ import torch.nn as nn
 #from equivariant_attention.modules import GConvSE3, GNormSE3
 #from equivariant_attention.fibers import Fiber
 
-from rfdiffusion.util_module import init_lecun_normal_param
 from se3_transformer import SE3Transformer
 from se3_transformer.fiber import Fiber
+
+from .util_module import init_lecun_normal_param
 
 class SE3TransformerWrapper(nn.Module):
     """SE(3) equivariant GCN with attention"""

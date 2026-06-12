@@ -4,9 +4,9 @@ from quatorch.quaternion import Quaternion, FUNCTIONS_RETURNING_QUATERNION
 # Add missing conversons to quatorch
 FUNCTIONS_RETURNING_QUATERNION |= {torch.stack,torch.Tensor.detach}
 
-from rfdiffusion.util_module import *
-from rfdiffusion.Attention_module import *
-from rfdiffusion.SE3_network import SE3TransformerWrapper
+from .util_module import *
+from .Attention_module import *
+from .SE3_network import SE3TransformerWrapper
 
 # Components for three-track blocks
 # 1. MSA -> MSA update (biased attention. bias from pair & structure)

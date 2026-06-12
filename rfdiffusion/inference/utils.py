@@ -13,8 +13,8 @@ from quatorch import Quaternion
 
 from rfdiffusion.potentials.manager import PotentialManager
 from rfdiffusion.diffusion import get_beta_schedule, Diffuser
-from rfdiffusion.util import rigid_from_3_points
-from rfdiffusion import util
+from rfdiffusion.rosettafold import rigid_from_3_points
+from rfdiffusion.rosettafold import chemical
 
 ###########################################################
 #### Functions which can be called outside of Denoiser ####
@@ -491,7 +491,7 @@ def parse_pdb_lines(lines: list[str], parse_hetatom: bool = False, ignore_het_h:
             res.append((l[22:26], l[17:20]))
             # chain letter, res num
             pdb_idx.append((l[21:22].strip(), int(l[22:26].strip())))
-    seq = [util.aa2num[r[1]] if r[1] in util.aa2num.keys() else 20 for r in res]
+    seq = [chemical.aa2num[r[1]] if r[1] in chemical.aa2num.keys() else 20 for r in res]
     pdb_idx = [
         (l[21:22].strip(), int(l[22:26].strip()))
         for l in lines
@@ -511,9 +511,9 @@ def parse_pdb_lines(lines: list[str], parse_hetatom: bool = False, ignore_het_h:
         )
         if (chain,resNo) in pdb_idx:
             idx = pdb_idx.index((chain, resNo))
-            # for i_atm, tgtatm in enumerate(util.aa2long[util.aa2num[aa]]):
+            # for i_atm, tgtatm in enumerate(chemical.aa2long[chemical.aa2num[aa]]):
             for i_atm, tgtatm in enumerate(
-                util.aa2long[util.aa2num[aa]][:14]
+                chemical.aa2long[chemical.aa2num[aa]][:14]
                 ):
                 if (
                     tgtatm is not None and tgtatm.strip() == atom.strip()

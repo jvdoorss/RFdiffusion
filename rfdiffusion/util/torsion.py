@@ -1,21 +1,16 @@
+'''
+Utilities module computing (cached) torsions. 
+'''
+
 from functools import lru_cache
 
-from rfdiffusion.chemical import *
-from rfdiffusion.scoring import *
+import torch
 
+from rfdiffusion.rosettafold.chemical import (
+    aa2num, torsions, aa2long, ideal_coords, aa2longalt)
+from rfdiffusion.rosettafold import rigid_from_3_points
 
-def generate_Cbeta(N, Ca, C):
-    # recreate Cb given N,Ca,C
-    b = Ca - N
-    c = C - Ca
-    a = torch.cross(b, c, dim=-1)
-    # These are the values used during training
-    Cb = -0.58273431*a + 0.56802827*b - 0.54067466*c + Ca
-    # fd: below matches sidechain generator (=Rosetta params)
-    # Cb = -0.57910144 * a + 0.5689693 * b - 0.5441217 * c + Ca
-
-    return Cb
-
+from .geometry import make_frame
 
 def th_ang_v(ab, bc, eps: float = 1e-8):
     def th_norm(x, eps: float = 1e-8):
@@ -53,45 +48,6 @@ def th_dih_v(ab, bc, cd):
 
 def th_dih(a, b, c, d):
     return th_dih_v(a - b, b - c, c - d)
-
-
-# More complicated version splits error in CA-N and CA-C (giving more accurate CB position)
-# It returns the rigid transformation from local frame to global frame
-def rigid_from_3_points(N, Ca, C, non_ideal=False, eps=1e-8):
-    # N, Ca, C - [B,L, 3]
-    # R - [B,L, 3, 3], det(R)=1, inv(R) = R.T, R is a rotation matrix
-    B, L = N.shape[:2]
-
-    v1 = C - Ca
-    v2 = N - Ca
-    e1 = v1 / (torch.norm(v1, dim=-1, keepdim=True) + eps)
-    u2 = v2 - (torch.einsum("bli, bli -> bl", e1, v2)[..., None] * e1)
-    e2 = u2 / (torch.norm(u2, dim=-1, keepdim=True) + eps)
-    e3 = torch.cross(e1, e2, dim=-1)
-    R = torch.stack([e1, e2, e3], dim=-1)  # [B,L,3,3] - rotation matrix
-
-    if non_ideal:
-        v2 = v2 / (torch.norm(v2, dim=-1, keepdim=True) + eps)
-        cosref = torch.sum(e1 * v2, dim=-1)  # cosine of current N-CA-C bond angle
-        costgt = cos_ideal_NCAC.item()
-        cos2del = torch.clamp(
-            cosref * costgt
-            + torch.sqrt((1 - cosref * cosref) * (1 - costgt * costgt) + eps),
-            min=-1.0,
-            max=1.0,
-        )
-        cosdel = torch.sqrt(0.5 * (1 + cos2del) + eps)
-        sindel = torch.sign(costgt - cosref) * torch.sqrt(1 - 0.5 * (1 + cos2del) + eps)
-        Rp = torch.eye(3, device=N.device).repeat(B, L, 1, 1)
-        Rp[:, :, 0, 0] = cosdel
-        Rp[:, :, 0, 1] = -sindel
-        Rp[:, :, 1, 0] = sindel
-        Rp[:, :, 1, 1] = cosdel
-
-        R = torch.einsum("blij,bljk->blik", R, Rp)
-
-    return R, Ca
-
 
 def get_tor_mask(seq, torsion_indices, mask_in=None):
     B, L = seq.shape[:2]
@@ -220,209 +176,6 @@ def get_torsions(
 
     return torsions, torsions_alt, tors_mask, tors_planar
 
-
-def get_tips(xyz, seq):
-    B, L = xyz.shape[:2]
-
-    xyz_tips = torch.gather(
-        xyz, 2, tip_indices.to(xyz.device)[seq][:, :, None, None].expand(-1, -1, -1, 3)
-    ).reshape(B, L, 3)
-    mask = ~(torch.isnan(xyz_tips[:, :, 0]))
-    if torch.isnan(xyz_tips).any():  # replace NaN tip atom with virtual Cb atom
-        # three anchor atoms
-        N = xyz[:, :, 0]
-        Ca = xyz[:, :, 1]
-        C = xyz[:, :, 2]
-
-        # recreate Cb given N,Ca,C
-        b = Ca - N
-        c = C - Ca
-        a = torch.cross(b, c, dim=-1)
-        Cb = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + Ca
-
-        xyz_tips = torch.where(torch.isnan(xyz_tips), Cb, xyz_tips)
-    return xyz_tips, mask
-
-
-# process ideal frames
-def make_frame(X, Y):
-    Xn = X / torch.linalg.norm(X)
-    Y = Y - torch.dot(Y, Xn) * Xn
-    Yn = Y / torch.linalg.norm(Y)
-    Z = torch.cross(Xn, Yn, dim=-1)
-    Zn = Z / torch.linalg.norm(Z)
-
-    return torch.stack((Xn, Yn, Zn), dim=-1)
-
-
-def cross_product_matrix(u):
-    B, L = u.shape[:2]
-    matrix = torch.zeros((B, L, 3, 3), device=u.device)
-    matrix[:, :, 0, 1] = -u[..., 2]
-    matrix[:, :, 0, 2] = u[..., 1]
-    matrix[:, :, 1, 0] = u[..., 2]
-    matrix[:, :, 1, 2] = -u[..., 0]
-    matrix[:, :, 2, 0] = -u[..., 1]
-    matrix[:, :, 2, 1] = u[..., 0]
-    return matrix
-
-
-# writepdb
-def writepdb(
-    filename, atoms, seq, binderlen=None, idx_pdb=None, bfacts=None, chain_idx=None
-):
-    f = open(filename, "w")
-    ctr = 1
-    scpu = seq.cpu().squeeze()
-    atomscpu = atoms.cpu().squeeze()
-    if bfacts is None:
-        bfacts = torch.zeros(atomscpu.shape[0])
-    if idx_pdb is None:
-        idx_pdb = 1 + torch.arange(atomscpu.shape[0])
-
-    Bfacts = torch.clamp(bfacts.cpu(), 0, 1)
-    for i, s in enumerate(scpu):
-        if chain_idx is None:
-            if binderlen is not None:
-                if i < binderlen:
-                    chain = "A"
-                else:
-                    chain = "B"
-            elif binderlen is None:
-                chain = "A"
-        else:
-            chain = chain_idx[i]
-        if len(atomscpu.shape) == 2:
-            f.write(
-                "%-6s%5s %4s %3s %s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-                % (
-                    "ATOM",
-                    ctr,
-                    " CA ",
-                    num2aa[s],
-                    chain,
-                    idx_pdb[i],
-                    atomscpu[i, 0],
-                    atomscpu[i, 1],
-                    atomscpu[i, 2],
-                    1.0,
-                    Bfacts[i],
-                )
-            )
-            ctr += 1
-        elif atomscpu.shape[1] == 3:
-            for j, atm_j in enumerate([" N  ", " CA ", " C  "]):
-                f.write(
-                    "%-6s%5s %4s %3s %s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-                    % (
-                        "ATOM",
-                        ctr,
-                        atm_j,
-                        num2aa[s],
-                        chain,
-                        idx_pdb[i],
-                        atomscpu[i, j, 0],
-                        atomscpu[i, j, 1],
-                        atomscpu[i, j, 2],
-                        1.0,
-                        Bfacts[i],
-                    )
-                )
-                ctr += 1
-        elif atomscpu.shape[1] == 4:
-            for j, atm_j in enumerate([" N  ", " CA ", " C  ", " O  "]):
-                f.write(
-                    "%-6s%5s %4s %3s %s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-                    % (
-                        "ATOM",
-                        ctr,
-                        atm_j,
-                        num2aa[s],
-                        chain,
-                        idx_pdb[i],
-                        atomscpu[i, j, 0],
-                        atomscpu[i, j, 1],
-                        atomscpu[i, j, 2],
-                        1.0,
-                        Bfacts[i],
-                    )
-                )
-                ctr += 1
-
-        else:
-            natoms = atomscpu.shape[1]
-            if natoms != 14 and natoms != 27:
-                print("bad size!", atoms.shape)
-                assert False
-            atms = aa2long[s]
-            # his prot hack
-            if (
-                s == 8
-                and torch.linalg.norm(atomscpu[i, 9, :] - atomscpu[i, 5, :]) < 1.7
-            ):
-                atms = (
-                    " N  ",
-                    " CA ",
-                    " C  ",
-                    " O  ",
-                    " CB ",
-                    " CG ",
-                    " NE2",
-                    " CD2",
-                    " CE1",
-                    " ND1",
-                    None,
-                    None,
-                    None,
-                    None,
-                    " H  ",
-                    " HA ",
-                    "1HB ",
-                    "2HB ",
-                    " HD2",
-                    " HE1",
-                    " HD1",
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )  # his_d
-
-            for j, atm_j in enumerate(atms):
-                if (
-                    j < natoms and atm_j is not None
-                ):  # and not torch.isnan(atomscpu[i,j,:]).any()):
-                    f.write(
-                        "%-6s%5s %4s %3s %s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-                        % (
-                            "ATOM",
-                            ctr,
-                            atm_j,
-                            num2aa[s],
-                            chain,
-                            idx_pdb[i],
-                            atomscpu[i, j, 0],
-                            atomscpu[i, j, 1],
-                            atomscpu[i, j, 2],
-                            1.0,
-                            Bfacts[i],
-                        )
-                    )
-                    ctr += 1
-
-
-# resolve tip atom indices
-@lru_cache()
-def tip_indices(device: torch.device) -> torch.LongTensor:
-    tip_indices = torch.full((22,), 0)
-    for i in range(22):
-        tip_atm = aa2tip[i]
-        atm_long = aa2long[i]
-        tip_indices[i] = atm_long.index(tip_atm)
-    return tip_indices.to(device)
-
 # resolve torsion indices
 @lru_cache()
 def resolve_torsion_indices():
@@ -549,94 +302,6 @@ def reference_angles(device: torch.device = 'cpu') -> torch.Tensor:
     *_, angles = kinematic_parameters()
     return angles.to(device)
 
-N_BACKBONE_ATOMS = 3
-N_HEAVY = 14
-
-
-def writepdb_multi(
-    filename,
-    atoms_stack,
-    bfacts,
-    seq_stack,
-    backbone_only=False,
-    chain_ids=None,
-    use_hydrogens=True,
-):
-    """
-    Function for writing multiple structural states of the same sequence into a single
-    pdb file.
-    """
-
-    f = open(filename, "w")
-
-    if seq_stack.ndim != 2:
-        T = atoms_stack.shape[0]
-        seq_stack = torch.tile(seq_stack, (T, 1))
-    seq_stack = seq_stack.cpu()
-    for atoms, scpu in zip(atoms_stack, seq_stack):
-        ctr = 1
-        atomscpu = atoms.cpu()
-        Bfacts = torch.clamp(bfacts.cpu(), 0, 1)
-        for i, s in enumerate(scpu):
-            atms = aa2long[s]
-            for j, atm_j in enumerate(atms):
-                if backbone_only and j >= N_BACKBONE_ATOMS:
-                    break
-                if not use_hydrogens and j >= N_HEAVY:
-                    break
-                if (atm_j is None) or (torch.all(torch.isnan(atomscpu[i, j]))):
-                    continue
-                chain_id = "A"
-                if chain_ids is not None:
-                    chain_id = chain_ids[i]
-                f.write(
-                    "%-6s%5s %4s %3s %s%4d    %8.3f%8.3f%8.3f%6.2f%6.2f\n"
-                    % (
-                        "ATOM",
-                        ctr,
-                        atm_j,
-                        num2aa[s],
-                        chain_id,
-                        i + 1,
-                        atomscpu[i, j, 0],
-                        atomscpu[i, j, 1],
-                        atomscpu[i, j, 2],
-                        1.0,
-                        Bfacts[i],
-                    )
-                )
-                ctr += 1
-
-        f.write("ENDMDL\n")
-
-def calc_rmsd(xyz1, xyz2, eps=1e-6):
-    """
-    Calculates RMSD between two sets of atoms (L, 3)
-    """
-    # center to CA centroid
-    xyz1 = xyz1 - xyz1.mean(0)
-    xyz2 = xyz2 - xyz2.mean(0)
-
-    # Computation of the covariance matrix
-    C = xyz2.T @ xyz1
-
-    # Compute otimal rotation matrix using SVD
-    V, S, W = np.linalg.svd(C)
-
-    # get sign to ensure right-handedness
-    d = np.ones([3,3])
-    d[:,-1] = np.sign(np.linalg.det(V)*np.linalg.det(W))
-
-    # Rotation matrix U
-    U = (d*V) @ W
-
-    # Rotate xyz2
-    xyz2_ = xyz2 @ U
-    L = xyz2_.shape[0]
-    rmsd = np.sqrt(np.sum((xyz2_-xyz1)*(xyz2_-xyz1), axis=(0,1)) / L + eps)
-
-    return rmsd, U
-
 def get_torsions_initialized(   xyz_in: torch.Tensor, 
                                 seq: torch.Tensor, 
                                 mask_in: torch.BoolTensor | None = None) -> tuple[torch.Tensor,torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -645,4 +310,3 @@ def get_torsions_initialized(   xyz_in: torch.Tensor,
     _torsion_can_flip = torsion_can_flip(xyz_in.device)
     _reference_angles = reference_angles(xyz_in.device)
     return get_torsions(xyz_in, seq, _torsion_indices, _torsion_can_flip, _reference_angles, mask_in)
-

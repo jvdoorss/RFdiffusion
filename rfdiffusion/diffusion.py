@@ -11,7 +11,7 @@ from torch import Tensor, BoolTensor
 import numpy as np
 from numpy.typing import NDArray
 
-from rfdiffusion.util import rigid_from_3_points
+from rfdiffusion.rosettafold import rigid_from_3_points
 from rfdiffusion.igso3 import calculate_igso3, Quaternion, quaternion_from_rot_vector
 
 torch.set_printoptions(sci_mode=False)

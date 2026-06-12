@@ -5,7 +5,7 @@ import torch.nn.functional as nn
 from omegaconf import DictConfig, OmegaConf
 
 from rfdiffusion.kinematics import get_init_xyz, xyz_to_t2d
-from rfdiffusion.chemical import seq2chars
+from rfdiffusion.rosettafold import seq2chars
 from rfdiffusion.contigs import ContigMap
 from rfdiffusion.potentials.manager import PotentialManager
 

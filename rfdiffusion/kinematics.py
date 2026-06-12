@@ -1,6 +1,7 @@
 import numpy as np
 import torch
-from rfdiffusion.chemical import INIT_CRDS
+
+from rfdiffusion.rosettafold.chemical import INIT_CRDS
 from rfdiffusion.util import generate_Cbeta
 
 PARAMS = {
@@ -202,7 +203,7 @@ def xyz_to_bbtor(xyz, params=PARAMS):
     astep = 2.0*np.pi / params['ABINS']
     phi_bin = torch.round((phi+np.pi-astep/2)/astep)
     psi_bin = torch.round((psi+np.pi-astep/2)/astep)
-    return torch.stack([phi_bin, psi_bin], axis=-1).long()
+    return torch.stack([phi_bin, psi_bin], dim=-1).long()
 
 # ============================================================
 def dist_to_onehot(dist, params=PARAMS):
@@ -233,7 +234,7 @@ def c6d_to_bins(c6d,params=PARAMS):
     tb[db==params['DBINS']] = params['ABINS']
     pb[db==params['DBINS']] = params['ABINS']//2
 
-    return torch.stack([db,ob,tb,pb],axis=-1).to(torch.uint8)
+    return torch.stack([db,ob,tb,pb],dim=-1).to(torch.uint8)
 
 
 # ============================================================
@@ -278,7 +279,7 @@ def c6d_to_bins2(c6d, same_chain, negative=False, params=PARAMS):
         tb = torch.where(same_chain.bool(), tb.long(), params['ABINS'])
         pb = torch.where(same_chain.bool(), pb.long(), params['ABINS']//2)
     
-    return torch.stack([db,ob,tb,pb],axis=-1).long()
+    return torch.stack([db,ob,tb,pb],dim=-1).long()
 
 def get_init_xyz(xyz_t):
     # input: xyz_t (B, T, L, 14, 3)

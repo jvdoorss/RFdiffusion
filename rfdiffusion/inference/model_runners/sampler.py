@@ -12,14 +12,12 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
 from torch.nn.functional import one_hot
 
-from rfdiffusion.RoseTTAFoldModel import RoseTTAFoldModule
+from rfdiffusion.rosettafold import RoseTTAFoldModule, seq2chars
+from rfdiffusion.util import get_torsions, ComputeAllAtomCoords
 from rfdiffusion.kinematics import get_init_xyz, xyz_to_t2d
 from rfdiffusion.diffusion import Diffuser
-from rfdiffusion.chemical import seq2chars
-from rfdiffusion.util_module import ComputeAllAtomCoords
 from rfdiffusion.contigs import ContigMap
 from rfdiffusion.potentials.manager import PotentialManager
-from rfdiffusion.util import get_torsions_initialized
 from rfdiffusion.model_input_logger import pickle_function_call
 
 from rfdiffusion.inference.symmetry import SymGen
@@ -600,7 +598,7 @@ class Sampler:
     def get_alpha(self, t1d: Tensor, xyz_t: Tensor) -> Tensor:
         L = t1d.shape[-2]
         seq_tmp = t1d[..., :-1].argmax(dim=-1).reshape(-1, L)
-        alpha, _, alpha_mask, _ = get_torsions_initialized(xyz_t.reshape(-1, L, 27, 3), seq_tmp)
+        alpha, _, alpha_mask, _ = get_torsions(xyz_t.reshape(-1, L, 27, 3), seq_tmp)
         alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[..., 0]))
         alpha[torch.isnan(alpha)] = 0.0
         alpha = alpha.reshape(1, -1, L, 10, 2)
