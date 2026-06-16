@@ -1,18 +1,18 @@
 # script for diffusion protocols
-import torch
-import pickle
-import numpy as np
+
+from typing import Iterable
 import os
 import logging
-
-from scipy.spatial.transform import Rotation as scipy_R
-
-from rfdiffusion.util import rigid_from_3_points
-
-from rfdiffusion.util_module import ComputeAllAtomCoords
-
-from rfdiffusion import igso3
 import time
+import pickle
+
+import torch
+from torch import Tensor, BoolTensor
+import numpy as np
+from numpy.typing import NDArray
+
+from rfdiffusion.rosettafold import rigid_from_3_points
+from rfdiffusion.igso3 import calculate_igso3, Quaternion, quaternion_from_rot_vector
 
 torch.set_printoptions(sci_mode=False)
 
@@ -198,7 +198,7 @@ class IGSO3:
         self.igso3_vals = self._calc_igso3_vals(L=L)
         self.step_size = 1 / self.T
 
-    def _calc_igso3_vals(self, L=2000):
+    def _calc_igso3_vals(self, L=2000) -> dict[str, Tensor]:
         """_calc_igso3_vals computes numerical approximations to the
         relevant analytically intractable functionals of the igso3
         distribution.
@@ -233,7 +233,7 @@ class IGSO3:
             igso3_vals = read_pkl(cache_fname)
         else:
             self._log.info("Calculating IGSO3.")
-            igso3_vals = igso3.calculate_igso3(
+            igso3_vals = calculate_igso3(
                 num_sigma=self.num_sigma,
                 min_sigma=self.min_sigma,
                 max_sigma=self.max_sigma,
@@ -247,12 +247,12 @@ class IGSO3:
     def discrete_sigma(self):
         return self.igso3_vals["discrete_sigma"]
 
-    def sigma_idx(self, sigma: np.ndarray):
+    def sigma_idx(self, sigma: Tensor | NDArray):
         """
         Calculates the index for discretized sigma during IGSO(3) initialization."""
         return np.digitize(sigma, self.discrete_sigma) - 1
 
-    def t_to_idx(self, t: np.ndarray):
+    def t_to_idx(self, t: Tensor | NDArray):
         """
         Helper function to go from discrete time index t to corresponding sigma_idx.
 
@@ -262,14 +262,14 @@ class IGSO3:
         continuous_t = t / self.T
         return self.sigma_idx(self.sigma(continuous_t))
 
-    def sigma(self, t: torch.tensor):
-        """
+    def sigma(self, t: Tensor | NDArray) -> NDArray:
+        r"""
         Extract \sigma(t) corresponding to chosen sigma schedule.
 
         Args:
             t: torch tensor with time between 0 and 1
         """
-        if not type(t) == torch.Tensor:
+        if not type(t) == Tensor:
             t = torch.tensor(t)
         if torch.any(t < 0) or torch.any(t > 1):
             raise ValueError(f"Invalid t={t}")
@@ -287,7 +287,7 @@ class IGSO3:
             raise ValueError(f"Unrecognize schedule {self.schedule}")
 
     def g(self, t):
-        """
+        r"""
         g returns the drift coefficient at time t
 
         since
@@ -306,7 +306,7 @@ class IGSO3:
         grads = torch.autograd.grad(sigma_sqr.sum(), t)[0]
         return torch.sqrt(grads)
 
-    def sample(self, ts, n_samples=1):
+    def sample(self, ts, n_samples=1) -> NDArray:
         """
         sample uses the inverse cdf to sample an angle of rotation from
         IGSO(3)
@@ -329,7 +329,7 @@ class IGSO3:
             all_samples.append(sample_i)
         return np.stack(all_samples, axis=0)
 
-    def sample_vec(self, ts, n_samples=1):
+    def sample_vec(self, ts, n_samples: int = 1) -> NDArray:
         """sample_vec generates a rotation vector(s) from IGSO(3) at time steps
         ts.
 
@@ -340,7 +340,7 @@ class IGSO3:
         x /= np.linalg.norm(x, axis=-1, keepdims=True)
         return x * self.sample(ts, n_samples=n_samples)[..., None]
 
-    def score_norm(self, t, omega):
+    def score_norm(self, t, omega) -> NDArray:
         """
         score_norm computes the score norm based on the time step and angle
         Args:
@@ -374,9 +374,7 @@ class IGSO3:
         """
         omega = np.linalg.norm(vec, axis=-1)
         all_score_norm = []
-        for i, t in enumerate(ts):
-            omega_t = omega[i]
-            t_idx = t - 1
+        for omega_t, t in zip(omega,ts):
             sigma_idx = self.t_to_idx(t)
             score_norm_t = np.interp(
                 omega_t,
@@ -394,7 +392,7 @@ class IGSO3:
         sigma_idcs = [self.t_to_idx(t) for t in ts]
         return self.igso3_vals["exp_score_norms"][sigma_idcs]
 
-    def diffuse_frames(self, xyz, t_list, diffusion_mask=None):
+    def diffuse_frames(self, xyz: Tensor, t_list: list[int] | None, diffusion_mask: NDArray | None = None) -> tuple[Tensor, Quaternion]:
         """diffuse_frames samples from the IGSO(3) distribution to noise frames
 
         Parameters:
@@ -405,55 +403,48 @@ class IGSO3:
                         (T,L,3,3), where T is num timesteps
         """
 
-        if torch.is_tensor(xyz):
-            xyz = xyz.numpy()
-
-        t = np.arange(self.T) + 1  # 1-indexed!!
+        t = torch.arange(self.T) + 1  # 1-indexed!!
         num_res = len(xyz)
 
-        N = torch.from_numpy(xyz[None, :, 0, :])
-        Ca = torch.from_numpy(xyz[None, :, 1, :])  # [1, num_res, 3, 3]
-        C = torch.from_numpy(xyz[None, :, 2, :])
+        N = xyz[None, :, 0, :]
+        Ca = xyz[None, :, 1, :]  # [1, num_res, 3, 3]
+        C = xyz[None, :, 2, :]
 
         # scipy rotation object for true coordinates
-        R_true, Ca = rigid_from_3_points(N, Ca, C)
-        R_true = R_true[0]
+        R_true_mat, Ca = rigid_from_3_points(N, Ca, C)
+        R_true = Quaternion.from_rotation_matrix(R_true_mat[0])
         Ca = Ca[0]
 
         # Sample rotations and scores from IGSO3
-        sampled_rots = self.sample_vec(t, n_samples=num_res)  # [T, N, 3]
+        sampled_rots = self.sample_vec(t, n_samples=num_res)# [T, N, 3]
 
         if diffusion_mask is not None:
             non_diffusion_mask = 1 - diffusion_mask[None, :, None]
             sampled_rots = sampled_rots * non_diffusion_mask
 
+        sampled_rots = torch.from_numpy(sampled_rots).to(xyz)
+
         # Apply sampled rot.
-        R_sampled = (
-            scipy_R.from_rotvec(sampled_rots.reshape(-1, 3))
-            .as_matrix()
-            .reshape(self.T, num_res, 3, 3)
-        )
-        R_perturbed = np.einsum("tnij,njk->tnik", R_sampled, R_true)
+        R_sampled = quaternion_from_rot_vector(sampled_rots)
+
+        R_perturbed = R_sampled * R_true
         perturbed_crds = (
-            np.einsum(
-                "tnij,naj->tnai", R_sampled, xyz[:, :3, :] - Ca[:, None, ...].numpy()
-            )
-            + Ca[None, :, None].numpy()
+            R_sampled.unsqueeze(2).rotate_vector(xyz[:, :3, :] - Ca[:, None, ...]) + Ca[None, :, None]
         )
 
-        if t_list != None:
+        if t_list is not None:
             idx = [i - 1 for i in t_list]
             perturbed_crds = perturbed_crds[idx]
             R_perturbed = R_perturbed[idx]
 
         return (
-            perturbed_crds.transpose(1, 0, 2, 3),  # [L, T, 3, 3]
-            R_perturbed.transpose(1, 0, 2, 3),
+            perturbed_crds.permute(1, 0, 2, 3),  # [L, T, 3, 3]
+            R_perturbed.transpose(1, 0),
         )
 
     def reverse_sample_vectorized(
-        self, R_t, R_0, t, noise_level, mask=None, return_perturb=False
-    ):
+        self, R_t: Quaternion, R_0: Quaternion, t, noise_level, mask=None, return_perturb=False
+    ) -> Quaternion:
         """reverse_sample uses an approximation to the IGSO3 score to sample
         a rotation at the previous time step.
 
@@ -494,17 +485,14 @@ class IGSO3:
         differential equations. arXiv preprint arXiv:2011.13456.
         """
         # compute rotation vector corresponding to prediction of how r_t goes to r_0
-        R_0, R_t = torch.tensor(R_0), torch.tensor(R_t)
-        R_0t = torch.einsum("...ij,...kj->...ik", R_t, R_0)
-        R_0t_rotvec = torch.tensor(
-            scipy_R.from_matrix(R_0t.cpu().numpy()).as_rotvec()
-        ).to(R_0.device)
+        R_0t = R_t * R_0
+        R_0t_axis, Omega = R_0t.to_axis_angle()
 
         # Approximate the score based on the prediction of R0.
         # R_t @ hat(Score_approx) is the score approximation in the Lie algebra
         # SO(3) (i.e. the output of Algorithm 1)
-        Omega = torch.linalg.norm(R_0t_rotvec, axis=-1).numpy()
-        Score_approx = R_0t_rotvec * (self.score_norm(t, Omega) / Omega)[:, None]
+        score = torch.from_numpy(self.score_norm(t, Omega)).to(R_0t_axis)
+        Score_approx = R_0t_axis * score.unsqueeze(-1)
 
         # Compute scaling for score and sampled noise (following Eq 6 of [2])
         continuous_t = t / self.T
@@ -515,8 +503,7 @@ class IGSO3:
         # (up to a deceleration of time by a factor of two), for small enough
         # time-steps, this is equivalent to perturbing r_t with IG-SO(3) noise.
         # See e.g. Algorithm 1 of De Bortoli et al.
-        Z = np.random.normal(size=(R_0.shape[0], 3))
-        Z = torch.from_numpy(Z).to(Score_approx.device)
+        Z = torch.randn(R_0.shape[0], 3, device = Score_approx.device)
         Z *= noise_level
 
         Delta_r = (rot_g**2) * self.step_size * Score_approx
@@ -527,12 +514,12 @@ class IGSO3:
         Perturb_tangent = Delta_r + rot_g * np.sqrt(self.step_size) * Z
         if mask is not None:
             Perturb_tangent *= (1 - mask.long())[:, None, None]
-        Perturb = igso3.Exp(Perturb_tangent)
+        Perturb = quaternion_from_rot_vector(Perturb_tangent)
 
         if return_perturb:
             return Perturb
 
-        Interp_rot = torch.einsum("...ij,...jk->...ik", Perturb, R_t)
+        Interp_rot = Perturb * R_t
 
         return Interp_rot
 
@@ -599,12 +586,12 @@ class Diffuser:
 
     def diffuse_pose(
         self,
-        xyz,
-        seq,
-        atom_mask,
-        include_motif_sidechains=True,
-        diffusion_mask=None,
-        t_list=None,
+        xyz: Tensor,
+        seq: Iterable[int],
+        atom_mask: BoolTensor,
+        include_motif_sidechains: bool = True,
+        diffusion_mask: BoolTensor | None = None,
+        t_list: list[int] | None = None,
     ):
         """
         Given full atom xyz, sequence and atom mask, diffuse the protein frame
@@ -626,9 +613,8 @@ class Diffuser:
         """
 
         if diffusion_mask is None:
-            diffusion_mask = torch.zeros(len(xyz.squeeze())).to(dtype=bool)
+            diffusion_mask = torch.zeros(len(xyz.squeeze()), device = xyz.device, dtype=bool)
 
-        get_allatom = ComputeAllAtomCoords().to(device=xyz.device)
         L = len(xyz)
 
         # bring to origin and scale
@@ -637,44 +623,36 @@ class Diffuser:
         assert torch.sum(~nan_mask) == 0
 
         # Centre unmasked structure at origin, as in training (to prevent information leak)
-        if torch.sum(diffusion_mask) != 0:
-            self.motif_com = xyz[diffusion_mask, 1, :].mean(
-                dim=0
-            )  # This is needed for one of the potentials
+        if diffusion_mask.any():
+            self.motif_com = xyz[diffusion_mask, 1, :].mean(dim=0)  # This is needed for one of the potentials
             xyz = xyz - self.motif_com
-        elif torch.sum(diffusion_mask) == 0:
+        else:
             xyz = xyz - xyz[:, 1, :].mean(dim=0)
 
         xyz_true = torch.clone(xyz)
         xyz = xyz * self.crd_scale
 
         # 1 get translations
-        tick = time.time()
         diffused_T, deltas = self.eucl_diffuser.diffuse_translations(
             xyz[:, :3, :].clone(), diffusion_mask=diffusion_mask
         )
-        # print('Time to diffuse coordinates: ',time.time()-tick)
         diffused_T /= self.crd_scale
         deltas /= self.crd_scale
 
         # 2 get frames
-        tick = time.time()
         diffused_frame_crds, diffused_frames = self.so3_diffuser.diffuse_frames(
             xyz[:, :3, :].clone(), diffusion_mask=diffusion_mask.numpy(), t_list=None
         )
         diffused_frame_crds /= self.crd_scale
-        # print('Time to diffuse frames: ',time.time()-tick)
 
         ##### Now combine all the diffused quantities to make full atom diffused poses
-        tick = time.time()
         cum_delta = deltas.cumsum(dim=1)
         # The coordinates of the translated AND rotated frames
         diffused_BB = (
-            torch.from_numpy(diffused_frame_crds) + cum_delta[:, :, None, :]
+            diffused_frame_crds + cum_delta[:, :, None, :]
         ).transpose(
             0, 1
         )  # [n,L,3,3]
-        # diffused_BB  = torch.from_numpy(diffused_frame_crds).transpose(0,1)
 
         # diffused_BB is [t_steps,L,3,3]
         t_steps, L = diffused_BB.shape[:2]

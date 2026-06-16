@@ -1,14 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from opt_einsum import contract as einsum
 import torch.utils.checkpoint as checkpoint
-from rfdiffusion.util import get_tips
-from rfdiffusion.util_module import Dropout, create_custom_forward, rbf, init_lecun_normal, find_breaks
-from rfdiffusion.Attention_module import Attention, FeedForwardLayer, AttentionWithBias
-from rfdiffusion.Track_module import PairStr2Pair
-import math
-import numpy as np 
+
+from .util_module import Dropout, create_custom_forward, rbf, init_lecun_normal, find_chainids
+from .Attention_module import Attention, FeedForwardLayer, AttentionWithBias
+from .Track_module import PairStr2Pair
 
 # Module contains classes and functions to generate initial embeddings
 
@@ -30,14 +27,9 @@ class PositionalEncoding2D(nn.Module):
 
         # adding support for multi-chain cyclic
         # find chain breaks and label chain ids
-        breaks = find_breaks(idx.squeeze().cpu().numpy(), thresh=35)  # NOTE: Hard coded threshold for defining chain breaks here
+        chainids = find_chainids(idx.squeeze(), thresh=35)  # NOTE: Hard coded threshold for defining chain breaks here
                                                                       #       Typical jump for chainbreaks is +200
                                                                       #       Assumes monotonically increasing absolute IDX
-
-        chainids = np.zeros_like(idx.squeeze().cpu().numpy())
-        for i, b in enumerate(breaks):
-            chainids[b:] = i+1
-        chainids = torch.from_numpy(chainids).to(device=idx.device)
 
         # cyclic peptide
         if cyclize is not None:
